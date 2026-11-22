@@ -63,6 +63,10 @@ namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver*
 namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include <pthread.h>
+#include "nx/nx_platform.h"
+#endif
 namespace {
 struct Symbol {
     std::string nid, library, module;
@@ -180,6 +184,10 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 microseconds) {
 }
 } // namespace Libraries::Kernel
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include <pthread.h>
+#include "nx/nx_platform.h"
+#endif
 namespace {
 // SDL video must be driven from one thread: the window lives on its own host thread.
 std::thread g_window_thread;
@@ -198,7 +206,15 @@ static void SelectRenderer() {
     char cause[320] = "", advice[320] = "";
     const bool vulkan_usable = choice != DcpRenderer::Auto ||
                                dcp_check_vulkan(cause, sizeof(cause), advice, sizeof(advice));
-    const auto resolution = DcpRenderer::Resolve(choice, vulkan_usable, cause);
+    auto resolution = DcpRenderer::Resolve(choice, vulkan_usable, cause);
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    /* switch-mesa is an OpenGL ES driver: there is no Vulkan device and no desktop-GL context. */
+    if (resolution.backend != DcpRenderer::Backend::OpenGL) {
+        std::printf("Renderer: forcing OpenGL ES (the Switch build has no Vulkan or desktop-GL backend)\n");
+        resolution.backend = DcpRenderer::Backend::OpenGL;
+        resolution.fallback_reason.clear();
+    }
+#endif
     DcpRenderer::SetActive(resolution.backend);
     std::printf("Renderer: selected %s, active %s\n",
                 std::string(DcpRenderer::ChoiceKeys[choice]).c_str(),
@@ -224,7 +240,10 @@ extern "C" int dcpgpu_init(const DcpGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Dragon's Crown Pro";
     const s32 width = config->width, height = config->height;
-    g_window_thread = std::thread([title, width, height] {
+    auto window_loop = [title, width, height] {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        nx_platform_trace("dcpgpu: window thread entered\n");
+#endif
         Common::SetCurrentThreadName("dcp:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str(),
                                                Frontend::GraphicsApiFor(DcpRenderer::Active()));
@@ -237,6 +256,9 @@ extern "C" int dcpgpu_init(const DcpGpuConfig* config) {
         while (window->PollEvents()) {
             SDL_Delay(2);
         }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        nx_platform_trace("WindowSDL: PollEvents returned false, exiting\n");
+#endif
         dcp_startup_phase("runtime window closed");
         LOG_INFO(Frontend, "Window closed by user");
         runtime_log_mark_clean_exit();
@@ -244,12 +266,40 @@ extern "C" int dcpgpu_init(const DcpGpuConfig* config) {
         runtime_log_flush();
         dcp_startup_phase("process exit");
         std::_Exit(0);
-    });
+    };
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    {
+        struct Launch { decltype(window_loop) fn; };
+        auto* launch = new Launch{std::move(window_loop)};
+        pthread_t tid{};
+        pthread_attr_t attr{};
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 1024 * 1024);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        const int rc = pthread_create(&tid, &attr, [](void* arg) -> void* {
+            auto* l = static_cast<Launch*>(arg);
+            auto fn = std::move(l->fn);
+            delete l;
+            fn();
+            return nullptr;
+        }, launch);
+        pthread_attr_destroy(&attr);
+        nx_platform_trace("dcpgpu: pthread_create rc=%d\n", rc);
+    }
+#else
+    g_window_thread = std::thread(std::move(window_loop));
     g_window_thread.detach();
+#endif
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    nx_platform_trace("dcpgpu: waiting for window_ready\n");
+#endif
     {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    nx_platform_trace("dcpgpu: window ready, registering GnmDriver + VideoOut\n");
+#endif
     Core::Loader::SymbolsResolver resolver;
     // GnmDriver creates the presenter that the VideoOut present thread uses.
     Libraries::GnmDriver::RegisterLib(&resolver);

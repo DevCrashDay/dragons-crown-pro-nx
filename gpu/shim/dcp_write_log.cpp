@@ -9,6 +9,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #undef near
+#elif defined(__SWITCH__)
+#include <unistd.h>
 #else
 #include <ucontext.h>
 #include <unistd.h>
@@ -61,7 +63,12 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 }
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
-    static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+    static thread_local const std::uint32_t tid =
+#ifdef __SWITCH__
+        0;
+#else
+        static_cast<std::uint32_t>(gettid());
+#endif
     Entry e{address, size, 0, __rdtsc(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
@@ -93,6 +100,9 @@ extern "C" void dcpgpu_dump_guest_writes(void* ucontext) {
     // The loader passes EXCEPTION_POINTERS (see signal_context.cpp).
     const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
     const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
+#elif defined(__SWITCH__)
+    (void)ucontext;
+    const std::uint64_t regs[8] = {};
 #else
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
     const auto* g = uc->uc_mcontext.gregs;

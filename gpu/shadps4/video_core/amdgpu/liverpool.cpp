@@ -1328,7 +1328,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && DcpStats::enabled) {
         DcpStats::submissions.fetch_add(1, std::memory_order_relaxed);
-#ifndef _WIN32 // dcp: per-thread rusage statistics are Linux-only
+#if !defined(_WIN32) && !defined(__SWITCH__) // dcp: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             DcpStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);

@@ -38,10 +38,18 @@ static inline u64 FencedRDTSC() {
     return (edx << 32) | eax;
 #elif defined(ARCH_ARM64)
     u64 ret;
+#ifdef __SWITCH__
+    /* Horizon traps EL0 CNTVCT_EL0; CNTPCT_EL0 is readable at EL0 (libnx armGetSystemTick). */
+    asm volatile("isb\n\t"
+                 "mrs %0, cntpct_el0\n\t"
+                 "isb\n\t"
+                 : "=r"(ret)::"memory");
+#else
     asm volatile("isb\n\t"
                  "mrs %0, cntvct_el0\n\t"
                  "isb\n\t"
                  : "=r"(ret)::"memory");
+#endif
     return ret;
 #else
 #error "Missing FencedRDTSC() implementation for target CPU architecture."

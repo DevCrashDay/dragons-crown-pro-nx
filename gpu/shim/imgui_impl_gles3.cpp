@@ -1,4 +1,4 @@
-#ifdef _WIN32
+#if defined(_WIN32) || defined(DCP_SWITCH_OPENGL_ONLY)
 
 // The ES3 build of imgui's backend, with its public names changed so it links beside the desktop build.
 #define IMGUI_IMPL_OPENGL_ES3
@@ -15,8 +15,8 @@
 
 #include "imgui_impl_gles3.h"
 
-bool InitImGuiGles3() {
-    return LoadGles3ForImGui() && ImGui_ImplOpenGL3_Init("#version 300 es");
+bool InitImGuiGles3(const char* glsl_version) {
+    return LoadGles3ForImGui() && ImGui_ImplOpenGL3_Init(glsl_version);
 }
 
 void ImGuiGles3NewFrame() {

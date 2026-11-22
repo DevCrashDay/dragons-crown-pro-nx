@@ -10,6 +10,10 @@
 #ifdef _WIN32
 #include <bit>
 #include <windows.h>
+#elif defined(__SWITCH__)
+#define u128 nx_u128
+#include <switch.h>
+#undef u128
 #else
 #include <sched.h>
 #include <sys/resource.h>
@@ -30,6 +34,14 @@ inline unsigned Available() {
 /// The calling thread only runs when cores are otherwise idle (lowest Windows priority).
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+#elif defined(__SWITCH__)
+inline unsigned Available() {
+    return 3u;
+}
+
+inline void MakeBackground() {
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3B);
 }
 #else
 

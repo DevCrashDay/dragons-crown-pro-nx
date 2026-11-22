@@ -2,6 +2,29 @@
 // The launcher's list of Vulkan devices the renderer can use (the Graphics card row), and the check that Vulkan can run
 // the renderer at all.
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include <cstdio>
+#include "dcp_renderer.h"
+#include "dcp_settings.h"
+
+extern "C" int dcp_check_vulkan(char* cause, size_t cause_size, char* advice, size_t advice_size) {
+    std::snprintf(cause, cause_size, "Vulkan is disabled on Nintendo Switch OpenGL build.");
+    std::snprintf(advice, advice_size, "Use OpenGL renderer.");
+    return 0;
+}
+
+extern "C" int dcp_check_renderer(const char*, char*, size_t, char*, size_t) {
+    return 1;
+}
+
+extern "C" int dcp_gpu_names(char (*names)[256], int max) {
+    if (max > 0) {
+        std::snprintf(names[0], 256, "Nintendo Switch (Tegra X1 OpenGL)");
+        return 1;
+    }
+    return 0;
+}
+#else
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -149,3 +172,4 @@ extern "C" int dcp_gpu_names(char (*names)[256], int max) {
     }
     return count;
 }
+#endif // DCP_SWITCH_OPENGL_ONLY

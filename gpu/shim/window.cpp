@@ -29,6 +29,9 @@
 #include "video_core/renderer_opengl/gl_angle.h"
 #endif
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include "nx/nx_platform.h"
+#endif
 extern "C" void runtime_log_flush(void);
 
 namespace Frontend {
@@ -63,6 +66,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         ExitNoWindow("Cannot initialize SDL video", SDL_GetError());
     }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    nx_platform_trace("WindowSDL: SDL video+gamepad ok\n");
+#endif
     // The launcher's Window size and Monitor settings; the same display list as its Monitor row.
     const auto& settings = DcpSettings::Get();
     const std::vector<dcp::Display> displays = dcp::ListDisplays();
@@ -74,6 +80,40 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
     if (display) {
         window_x = window_y = SDL_WINDOWPOS_CENTERED_DISPLAY(display->id);
     }
+    if (api == GraphicsApi::OpenGL) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const char* gl_mode = std::getenv("DCP_GL_MODE");
+        const bool use_gles = gl_mode && !std::strcmp(gl_mode, "gles");
+        if (use_gles) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        }
+#else
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+    }
+    base_title = title;
+    title_shown = title;
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    window = SDL_CreateWindow(title, 0, 0, window_width, window_height,
+                              SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
+    if (!window) {
+        ExitNoWindow("Cannot create the game window", SDL_GetError());
+    }
+    nx_platform_trace("WindowSDL: SDL_CreateWindow ok (%dx%d)\n", window_width, window_height);
+    const char* driver = SDL_GetCurrentVideoDriver();
+    window_info.type = WindowSystemType::Headless;
+#else
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, window_x);
@@ -87,19 +127,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
         OpenGL::RequestAngleDirect3D11();
     }
 #endif
-    if (api == GraphicsApi::OpenGL) {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
-        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
-    }
     SDL_SetBooleanProperty(props, api == GraphicsApi::Vulkan ? SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN
                                                              : SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN,
                            true);
-    base_title = title;
-    title_shown = title;
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (!window) {
@@ -130,6 +160,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }
+#endif
+#if !defined(DCP_SWITCH_OPENGL_ONLY)
     if (display) {
         // Hidden until the real title bar and frame are known, so the decorated window is fitted and centred once.
         dcp::WindowBorders borders;
@@ -148,14 +180,25 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
     }
     ApplyDisplayMode(DcpSettings::Get().display_mode);
     SDL_ShowWindow(window);
+#endif
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    SDL_DisplayMode mode_val{};
+    if (SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window), &mode_val) == 0) {
+        DcpSettings::Get().display_refresh_hz = static_cast<float>(mode_val.refresh_rate);
+    }
+#else
     if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
         DcpSettings::Get().display_refresh_hz = mode->refresh_rate;
     }
+#endif
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    nx_platform_trace("WindowSDL: ready %dx%d on %s\n", w, h, driver ? driver : "(none)");
+#endif
     LogGamescopeWindow();
     const std::string display_name = display && !display->name.empty() ? " (" + display->name + ")" : "";
     std::printf("Window: display %d of %zu%s, size %dx%d, VSync %s, frame rate in title %s, "
@@ -163,8 +206,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
                 display ? int(display - displays.data()) + 1 : 0, displays.size(), display_name.c_str(),
                 window_width, window_height, settings.vsync ? "on" : "off", settings.show_fps_title ? "on" : "off",
                 settings.show_resolution_title ? "on" : "off");
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    std::printf("Display: refresh %d Hz\n", mode_val.refresh_rate);
+#else
     const SDL_DisplayMode* current = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
     std::printf("Display: refresh %.2f Hz\n", current ? current->refresh_rate : 0.0f);
+#endif
 #ifndef _WIN32
     std::printf("Session: %s\n", DcpPresent::DescribeSession(DcpPresent::GamescopeSession(), std::getenv).c_str());
 #endif
@@ -209,7 +256,11 @@ void WindowSDL::ApplyDisplayMode(int mode) {
 
 WindowSDL::~WindowSDL() {
     ReleaseMouse();
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    SDL_ShowCursor(SDL_ENABLE);
+#else
     SDL_ShowCursor();
+#endif
     SDL_DestroyWindow(window);
 }
 
@@ -289,7 +340,11 @@ void WindowSDL::UpdateCursor() {
     const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
     if (const auto visible = cursor.Update(true, focused, DcpOverlay::CapturesInput(), mouse_capture.Captured())) {
         if (*visible) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+            SDL_ShowCursor(SDL_ENABLE);
+#else
             SDL_ShowCursor();
+#endif
         } else {
             SDL_HideCursor();
         }
@@ -310,7 +365,7 @@ void WindowSDL::UpdateMouseCapture() {
         dcp_touchscreen_block(dcp_touchscreen_global(), blocked);
     }
     if (const auto relative = mouse_capture.Update(frame)) {
-        if (!SDL_SetWindowRelativeMouseMode(window, *relative)) {
+        if (SDL_SetWindowRelativeMouseMode(window, *relative ? SDL_TRUE : SDL_FALSE) < 0) {
             LOG_WARNING(Frontend, "Relative mouse mode: {}", SDL_GetError());
         }
     }
@@ -321,7 +376,7 @@ void WindowSDL::ReleaseMouse() {
     dcp_mouse_release_all(dcp_mouse_global());
     dcp_touchscreen_release_all(dcp_touchscreen_global());
     if (mouse_capture.Release()) {
-        SDL_SetWindowRelativeMouseMode(window, false);
+        SDL_SetWindowRelativeMouseMode(window, SDL_FALSE);
     }
 }
 
@@ -330,12 +385,12 @@ bool WindowSDL::TrackControllerEvent(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
-        pad_activity.erase(event.gdevice.which);
+        pad_activity.erase(event.cdevice.which);
         return false;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
-        PadActivity& pad = pad_activity[event.gbutton.which];
-        const u32 bit = event.gbutton.button < 32 ? 1u << event.gbutton.button : 0u;
+        PadActivity& pad = pad_activity[event.cbutton.which];
+        const u32 bit = event.cbutton.button < 32 ? 1u << event.cbutton.button : 0u;
         if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
             pad.state.buttons |= bit;
         } else {
@@ -344,14 +399,14 @@ bool WindowSDL::TrackControllerEvent(const SDL_Event& event) {
         return pad.filter.Update(pad.state);
     }
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
-        PadActivity& pad = pad_activity[event.gaxis.which];
-        switch (event.gaxis.axis) {
-        case SDL_GAMEPAD_AXIS_LEFTX: pad.state.left_x = event.gaxis.value; break;
-        case SDL_GAMEPAD_AXIS_LEFTY: pad.state.left_y = event.gaxis.value; break;
-        case SDL_GAMEPAD_AXIS_RIGHTX: pad.state.right_x = event.gaxis.value; break;
-        case SDL_GAMEPAD_AXIS_RIGHTY: pad.state.right_y = event.gaxis.value; break;
-        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: pad.state.left_trigger = event.gaxis.value; break;
-        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: pad.state.right_trigger = event.gaxis.value; break;
+        PadActivity& pad = pad_activity[event.caxis.which];
+        switch (event.caxis.axis) {
+        case SDL_GAMEPAD_AXIS_LEFTX: pad.state.left_x = event.caxis.value; break;
+        case SDL_GAMEPAD_AXIS_LEFTY: pad.state.left_y = event.caxis.value; break;
+        case SDL_GAMEPAD_AXIS_RIGHTX: pad.state.right_x = event.caxis.value; break;
+        case SDL_GAMEPAD_AXIS_RIGHTY: pad.state.right_y = event.caxis.value; break;
+        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: pad.state.left_trigger = event.caxis.value; break;
+        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: pad.state.right_trigger = event.caxis.value; break;
         default: return false;
         }
         return pad.filter.Update(pad.state);
@@ -376,7 +431,7 @@ unsigned WindowSDL::HeldButtons() const {
 
 // Window thread, after TrackControllerEvent recorded the axis.
 bool WindowSDL::RightStickMoved(const SDL_Event& event) const {
-    const SDL_GamepadAxisEvent& axis = event.gaxis;
+    const SDL_GamepadAxisEvent& axis = event.caxis;
     if (axis.axis != SDL_GAMEPAD_AXIS_RIGHTX && axis.axis != SDL_GAMEPAD_AXIS_RIGHTY) {
         return false;
     }
@@ -396,7 +451,7 @@ static DcpTouchArea GameTouchArea() {
 
 void WindowSDL::HandleTouch(const SDL_Event& event, bool ui) {
     const SDL_TouchFingerEvent& finger = event.tfinger;
-    if (!DcpTouchRoute::AcceptedTouch(finger.touchID, SDL_GetTouchDeviceType(finger.touchID))) {
+    if (!DcpTouchRoute::AcceptedTouch(finger.touchId, SDL_GetTouchDeviceType(finger.touchId))) {
         return;
     }
     DcpTouchscreen* const screen = dcp_touchscreen_global();
@@ -408,16 +463,16 @@ void WindowSDL::HandleTouch(const SDL_Event& event, bool ui) {
         }
         dcp_touch_telemetry_record(DCP_TOUCH_EVENT_DETECTED);
         cursor.ControllerActivity();
-        dcp_touchscreen_down(screen, finger.fingerID, area, finger.x, finger.y, finger.timestamp);
+        dcp_touchscreen_down(screen, finger.fingerId, area, finger.x, finger.y, finger.timestamp);
         break;
     case SDL_EVENT_FINGER_MOTION:
-        dcp_touchscreen_motion(screen, finger.fingerID, area, finger.x, finger.y);
+        dcp_touchscreen_motion(screen, finger.fingerId, area, finger.x, finger.y);
         break;
     case SDL_EVENT_FINGER_UP:
-        dcp_touchscreen_up(screen, finger.fingerID, area, finger.x, finger.y, finger.timestamp);
+        dcp_touchscreen_up(screen, finger.fingerId, area, finger.x, finger.y, finger.timestamp);
         break;
     default:
-        dcp_touchscreen_cancel(screen, finger.fingerID);
+        dcp_touchscreen_cancel(screen, finger.fingerId);
         break;
     }
 }
@@ -434,7 +489,7 @@ bool WindowSDL::PollEvents() {
         if (text_requested) { // SDL text input must be toggled from the window thread
             text_requested = false;
             text_active = true;
-            SDL_StartTextInput(window);
+            SDL_StartTextInput();
             UpdateTextTitle();
         }
     }
@@ -456,19 +511,28 @@ bool WindowSDL::PollEvents() {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {
                 text += event.text.text;
-            } else if (event.key.key == SDLK_BACKSPACE && !text.empty()) {
+            } else if (event.key.keysym.sym == SDLK_BACKSPACE && !text.empty()) {
                 size_t cut = text.size() - 1; // drop one UTF-8 code point
                 while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) --cut;
                 text.erase(cut);
-            } else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER || event.key.key == SDLK_ESCAPE) {
-                text_state = event.key.key == SDLK_ESCAPE ? 2 : 1;
+            } else if (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER || event.key.keysym.sym == SDLK_ESCAPE) {
+                text_state = event.key.keysym.sym == SDLK_ESCAPE ? 2 : 1;
                 text_active = false;
-                SDL_StopTextInput(window);
+                SDL_StopTextInput();
             }
             UpdateTextTitle();
             continue;
         }
         // The controller finishes the text dialog too: Cross (A) accepts, Circle (B) cancels.
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+            (event.cbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ||
+             event.cbutton.button == SDL_GAMEPAD_BUTTON_EAST)) {
+            std::scoped_lock lock{text_mutex};
+            text_state = event.cbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
+            text_active = false;
+            SDL_StopTextInput();
+#else
         if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
             (event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ||
              event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)) {
@@ -476,6 +540,7 @@ bool WindowSDL::PollEvents() {
             text_state = event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
             text_active = false;
             SDL_StopTextInput(window);
+#endif
             UpdateTextTitle();
             continue;
         }
@@ -536,12 +601,17 @@ bool WindowSDL::PollEvents() {
             ReleaseMouse();
             break;
         case SDL_EVENT_KEY_DOWN: {
-            const bool window_shortcut = event.key.scancode == DcpSettings::Get().window_mode_key;
-            const bool hud_key = event.key.scancode == DcpPing::kFpsKey || event.key.scancode == DcpPing::kPingKey;
+#ifdef DCP_SWITCH_OPENGL_ONLY
+            const SDL_Scancode scancode = event.key.keysym.scancode;
+#else
+            const SDL_Scancode scancode = event.key.scancode;
+#endif
+            const bool window_shortcut = scancode == DcpSettings::Get().window_mode_key;
+            const bool hud_key = scancode == DcpPing::kFpsKey || scancode == DcpPing::kPingKey;
             const bool host_shortcut =
-                window_shortcut || hud_key || event.key.scancode == DcpSettings::Get().menu_key;
+                window_shortcut || hud_key || scancode == DcpSettings::Get().menu_key;
             const DcpPing::HudKey hud =
-                DcpPing::HudKeyFor(event.key.scancode, event.key.repeat, runtime_online_play_enabled() != 0);
+                DcpPing::HudKeyFor(scancode, event.key.repeat, runtime_online_play_enabled() != 0);
             auto& settings = DcpSettings::Get();
             if (window_shortcut && !event.key.repeat) {
                 ToggleBorderless();

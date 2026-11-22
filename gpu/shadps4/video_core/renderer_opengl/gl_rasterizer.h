@@ -91,6 +91,12 @@ public:
     GlState& State() {
         return state;
     }
+    u64 Draws() const {
+        return draws;
+    }
+    u64 DrawsReachingGl() const {
+        return draws_reaching_gl;
+    }
     /// Plain state for the presenter's own passes.
     void ResetState();
     void OnFlip();

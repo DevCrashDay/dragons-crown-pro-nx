@@ -13,7 +13,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 #include <sys/resource.h>
 #endif
 #include "common/assert.h"
@@ -433,7 +433,7 @@ void VideoOutDriver::Flip(const Request& req) {
         last_twf = twf;
         const u64 copy_ns = DcpStats::t_copy.load(), copy_bytes = DcpStats::copy_bytes.load();
         u64 proc_flt = 0;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
         if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
             proc_flt = usage.ru_minflt;
         }

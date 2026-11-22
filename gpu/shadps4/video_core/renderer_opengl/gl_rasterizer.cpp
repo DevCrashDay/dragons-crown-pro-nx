@@ -23,6 +23,10 @@
 #include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
 
+#ifdef __SWITCH__
+extern "C" void nx_platform_trace(const char* format, ...);
+#endif
+
 namespace OpenGL {
 namespace {
 
@@ -1207,6 +1211,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
         rect_tables ? PrepareIndexedRectangles(*program, index_offset, vertex_offset, instance_offset, rect_strips)
                     : BindVertexInputs(*program, instance_offset, moved_vertices, rect_list);
     if (!prepared) {
+        static bool logged_drop = false;
+        if (!logged_drop) {
+            logged_drop = true;
+            std::printf("OpenGL: draw dropped (prepared=0, rect_tables=%d)\n", rect_tables ? 1 : 0);
+        }
         return;
     }
 
@@ -1310,11 +1319,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
         gl::DrawArraysInstanced(mode, GLint(vertex_offset), count, instances);
     }
     if (++draws_reaching_gl == 1) {
+#ifdef __SWITCH__
+        nx_platform_trace("OpenGL: first guest draw submitted (vs %#llx, ps %#llx, %d indices)\n",
+                          static_cast<unsigned long long>(vs_info.pgm_hash),
+                          static_cast<unsigned long long>(
+                              program->fragment ? program->fragment->info->pgm_hash : 0),
+                          count);
+#else
         std::printf("OpenGL: first guest draw submitted (vs %#llx, ps %#llx, %d indices)\n",
                     static_cast<unsigned long long>(vs_info.pgm_hash),
                     static_cast<unsigned long long>(
                         program->fragment ? program->fragment->info->pgm_hash : 0),
                     count);
+#endif
     }
 }
 
@@ -1350,6 +1367,12 @@ bool Rasterizer::TryKnownCompute(const Shader::Info& info) {
     }
     if (info.pgm_hash == BufferFillShader && has_read && info.images.empty() &&
         AmdGpu::NumBitsPerElement(written.GetDataFmt()) == 32) {
+        if (written.base_address < 0x100000 || read.base_address < 0x100000) {
+            std::printf("TryKnownCompute: invalid address written=%#llx read=%#llx\n",
+                        static_cast<unsigned long long>(written.base_address),
+                        static_cast<unsigned long long>(read.base_address));
+            return false;
+        }
         const auto& cs = liverpool->GetCsRegs();
         const u64 threads = u64(cs.dim_x) * cs.num_thread_x.full;
         const u64 count = std::min<u64>(threads, written.GetSize() / 4);

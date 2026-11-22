@@ -45,7 +45,11 @@ inline std::string MissingGlesRequirement(const Capabilities& caps) {
         return "GL_EXT_texture_compression_s3tc is required for the game's BC1-BC3 textures";
     }
     if (!caps.draw_buffers_blend) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        // GLES 3.0 lacks GL_EXT_draw_buffers_indexed: the rasterizer falls back to one blend state.
+#else
         return "GL_EXT_draw_buffers_indexed is required for per-target blending";
+#endif
     }
     if (caps.max_texture_size < MinimumGlesTextureSize) {
         return "textures of " + std::to_string(MinimumGlesTextureSize) +

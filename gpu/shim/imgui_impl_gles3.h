@@ -3,6 +3,6 @@
 
 struct ImDrawData;
 
-bool InitImGuiGles3();
+bool InitImGuiGles3(const char* glsl_version = "#version 300 es");
 void ImGuiGles3NewFrame();
 void ImGuiGles3RenderDrawData(ImDrawData* draw_data);

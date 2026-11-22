@@ -105,6 +105,12 @@ void GuestWriteWatch::RecordNeighbor(Leaf& leaf, u32 index, u32 written) {
 // Pages are protected under the lock so a fault cannot undo an arm it raced with. Nothing under
 // the lock touches guest memory, so the fault handler can never wait for its own thread.
 std::optional<u64> GuestWriteWatch::TryArm(VAddr address, u64 size) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    /* The Switch heap cannot be write protected: never arm, so the texture cache compares content. */
+    (void)address;
+    (void)size;
+    return std::nullopt;
+#else
     if (size == 0 || address >= AddressLimit || size > AddressLimit - address) {
         return std::nullopt;
     }
@@ -131,6 +137,7 @@ std::optional<u64> GuestWriteWatch::TryArm(VAddr address, u64 size) {
     // armed page writable, and protecting it again is free of side effects.
     protect(first << PageBits, (end - first) << PageBits, false);
     return stamp;
+#endif
 }
 
 bool GuestWriteWatch::WrittenSince(VAddr address, u64 size, u64 stamp) const {

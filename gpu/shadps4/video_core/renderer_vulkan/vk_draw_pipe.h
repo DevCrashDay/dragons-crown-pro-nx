@@ -160,7 +160,11 @@ private:
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("dcp:DrawRec");
         on_stage_b = true;
+#ifdef __SWITCH__
+        stage_b_tid.store(0, std::memory_order_release);
+#else
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
+#endif
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,

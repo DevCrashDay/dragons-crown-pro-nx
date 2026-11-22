@@ -241,9 +241,15 @@ struct Info : InfoPersistent {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+#ifdef ARCH_X86_64
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
+#else
+        if (!srt_info.ops.empty()) {
+            RunSrtProgram(srt_info, user_data.data(), flattened_ud_buf.data());
+        }
+#endif
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {

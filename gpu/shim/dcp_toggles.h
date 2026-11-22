@@ -7,6 +7,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#ifdef __SWITCH__
+typedef jmp_buf sigjmp_buf;
+#define sigsetjmp(buffer, save) setjmp(buffer)
+#endif
 #ifdef _WIN32
 // Windows: no signals. The loader's exception handler resumes the faulting thread
 // in dcp_longjmp (src/compat_win.c: no unwinding through the faulting frames).

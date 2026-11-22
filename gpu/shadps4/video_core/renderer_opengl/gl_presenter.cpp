@@ -24,6 +24,13 @@
 #include "video_core/renderer_opengl/gl_rasterizer.h"
 
 extern "C" void runtime_log_flush(void);
+#ifdef __SWITCH__
+#include <unistd.h>
+extern "C" void nx_platform_trace(const char* format, ...);
+extern "C" void runtime_file_stats(uint64_t* out_reads, uint64_t* out_bytes);
+extern "C" int g_nx_trace_loop;
+extern "C" uint64_t g_nx_image_base;
+#endif
 
 namespace OpenGL {
 namespace {
@@ -79,7 +86,12 @@ void main() {
 )";
 
 bool RunsOnGles() {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    const char* gl_mode = std::getenv("DCP_GL_MODE");
+    return gl_mode && !std::strcmp(gl_mode, "gles");
+#else
     return DcpRenderer::Active() == DcpRenderer::Backend::Direct3D11;
+#endif
 }
 
 [[noreturn]] void Fatal(const std::string& message) {
@@ -187,13 +199,13 @@ Capabilities QueryGlesCapabilities() {
 }
 
 void LogGlesDevice(const Capabilities& capabilities) {
-    std::printf("Direct3D 11: vendor %s, renderer %s, version %s, GLSL ES %s\n", Text(GL_VENDOR),
+    std::printf("OpenGL ES: vendor %s, renderer %s, version %s, GLSL ES %s\n", Text(GL_VENDOR),
                 Text(GL_RENDERER), Text(GL_VERSION), Text(GL_SHADING_LANGUAGE_VERSION));
 #ifdef _WIN32
-    std::printf("Direct3D 11: %s\n", AngleDeviceDescription().c_str());
+    std::printf("OpenGL ES: %s\n", AngleDeviceDescription().c_str());
 #endif
     const auto yes_no = [](bool value) { return value ? "yes" : "no"; };
-    std::printf("Direct3D 11: BC4/BC5 %s, BC6/BC7 %s, sRGB BC1-BC3 %s, 16-bit normalized %s, anisotropy %s, "
+    std::printf("OpenGL ES: BC4/BC5 %s, BC6/BC7 %s, sRGB BC1-BC3 %s, 16-bit normalized %s, anisotropy %s, "
                 "depth clamp %s, provoking vertex %s, polygon mode %s, largest texture %d\n",
                 yes_no(capabilities.rgtc), yes_no(capabilities.bptc), yes_no(capabilities.s3tc_srgb),
                 yes_no(capabilities.norm16), yes_no(capabilities.anisotropy), yes_no(capabilities.depth_clamp),
@@ -209,7 +221,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     SDL_Window* sdl_window = window.GetSDLWindow();
     context = SDL_GL_CreateContext(sdl_window);
     if (!context) {
-        Fatal(std::string{gles ? "no OpenGL ES 3.0 context through ANGLE: " : "no OpenGL 3.3 core context: "} +
+        Fatal(std::string{gles ? "no OpenGL ES 3.0 context: " : "no OpenGL 3.3 core context: "} +
               SDL_GetError());
     }
     SDL_GL_MakeCurrent(sdl_window, nullptr);
@@ -228,9 +240,11 @@ void Presenter::InitializeOnGpuThread() {
         Fatal("the driver does not export " + missing_function);
     }
     if (gles) {
+#ifndef DCP_SWITCH_OPENGL_ONLY
         if (!IsAngleDirect3D11(Text(GL_RENDERER))) {
             Fatal(std::string{"ANGLE started on another backend: "} + Text(GL_RENDERER));
         }
+#endif
         const Capabilities capabilities = QueryGlesCapabilities();
         LogGlesDevice(capabilities);
         if (const auto missing = MissingRequirement(capabilities); !missing.empty()) {
@@ -380,6 +394,24 @@ void Presenter::Present(VideoCore::PresentFrame* present_frame, bool, bool is_ga
 }
 
 void Presenter::Show(const Frame& frame, bool is_game_frame) {
+    static u32 shown_count = 0;
+    static bool first_game_frame_logged = false;
+    ++shown_count;
+    const bool first_game = !first_game_frame_logged && !frame.blank && is_game_frame;
+    if (first_game) {
+        first_game_frame_logged = true;
+    }
+    if (shown_count == 1 || (shown_count % 60) == 0 || first_game) {
+#ifdef __SWITCH__
+        nx_platform_trace("Presenter: frame %u (%ux%u, blank=%d, game=%d)\n",
+                          shown_count, frame.width, frame.height, frame.blank ? 1 : 0, is_game_frame ? 1 : 0);
+        fsync(1);
+#else
+        std::printf("Presenter: frame %u (%ux%u, blank=%d, game=%d)\n",
+                    shown_count, frame.width, frame.height, frame.blank ? 1 : 0, is_game_frame ? 1 : 0);
+        std::fflush(stdout);
+#endif
+    }
     const int window_width = std::max(window.GetWidth(), 1);
     const int window_height = std::max(window.GetHeight(), 1);
     ApplySwapInterval();
@@ -423,6 +455,79 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
     if (is_game_frame) {
         DcpOverlay::LogPresent();
     }
+#ifdef __SWITCH__
+    if (shown_count == 1 || (shown_count % 60) == 0 || first_game) {
+        using ReadPixelsFn = void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+        static auto read_px = reinterpret_cast<ReadPixelsFn>(SDL_GL_GetProcAddress("glReadPixels"));
+        u8 max_rgb = 0;
+        u8 px[4] = {0, 0, 0, 0};
+        if (read_px) {
+            const int pts[5][2] = {{window_width / 2, window_height / 2},
+                                   {window_width / 4, window_height / 2},
+                                   {window_width * 3 / 4, window_height / 2},
+                                   {window_width - 120, 80},
+                                   {120, window_height - 80}};
+            for (int i = 0; i < 5; ++i) {
+                u8 p[4] = {0, 0, 0, 0};
+                read_px(pts[i][0], pts[i][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
+                if (i == 0) std::memcpy(px, p, 4);
+                max_rgb = std::max({max_rgb, p[0], p[1], p[2]});
+            }
+        }
+        const GLenum err = gl::GetError();
+        uint64_t f_reads = 0, f_bytes = 0;
+        runtime_file_stats(&f_reads, &f_bytes);
+        int32_t pending_loads = -1;
+        if (g_nx_image_base) {
+            uint64_t app = *reinterpret_cast<const volatile uint64_t*>(g_nx_image_base + 0xe78708);
+            if (app) {
+                uint64_t fs_mgr = *reinterpret_cast<const volatile uint64_t*>(app + 0x48);
+                if (fs_mgr) pending_loads = *reinterpret_cast<const volatile int32_t*>(fs_mgr + 0x78);
+            }
+        }
+        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) pending=%d center=(%u,%u,%u) max=%u glErr=0x%x\n",
+                          shown_count, window_width, window_height,
+                          static_cast<unsigned long long>(rasterizer->DrawsReachingGl()),
+                          static_cast<unsigned long long>(rasterizer->Draws()),
+                          static_cast<unsigned long long>(f_reads),
+                          static_cast<unsigned long long>(f_bytes / 1024),
+                          pending_loads,
+                          px[0], px[1], px[2], max_rgb, err);
+        static bool dumped_p4 = false;
+        if ((shown_count == 240 || (!dumped_p4 && pending_loads == 4)) && g_nx_image_base) {
+            if (pending_loads == 4) dumped_p4 = true;
+            uint64_t app = *reinterpret_cast<const volatile uint64_t*>(g_nx_image_base + 0xe78708);
+            uint64_t fs_mgr = app ? *reinterpret_cast<const volatile uint64_t*>(app + 0x48) : 0;
+            if (fs_mgr) {
+                for (int b = 0; b < 256; ++b) {
+                    uint64_t node = *reinterpret_cast<const volatile uint64_t*>(fs_mgr + 0x90 + b * 32);
+                    while (node) {
+                        uint64_t ent = *reinterpret_cast<const volatile uint64_t*>(node + 0x20);
+                        if (ent) {
+                            int32_t st = *reinterpret_cast<const volatile int32_t*>(ent + 0x54);
+                            uint32_t f50 = *reinterpret_cast<const volatile uint32_t*>(ent + 0x50);
+                            uint8_t b5b = *reinterpret_cast<const volatile uint8_t*>(ent + 0x5b);
+                            uint8_t b5c = *reinterpret_cast<const volatile uint8_t*>(ent + 0x5c);
+                            int32_t ref = *reinterpret_cast<const volatile int32_t*>(ent + 0x98);
+                            if (st != 2 && b5b != 0) {
+                                uint64_t cap = *reinterpret_cast<const volatile uint64_t*>(ent + 0xf0);
+                                const char* nm = (cap >= 16)
+                                    ? *reinterpret_cast<const char* const*>(ent + 0xd8)
+                                    : reinterpret_cast<const char*>(ent + 0xd8);
+                                uint64_t cri = *reinterpret_cast<const volatile uint64_t*>(ent + 0x90);
+                                int cri_st = cri ? *reinterpret_cast<const volatile uint8_t*>(cri + 0x5b) : -1;
+                                const char* cri_path = cri ? reinterpret_cast<const char*>(cri + 0x8c) : "?";
+                                nx_platform_trace("  PEND(#%u p=%d): f50=0x%x b5b=%u b5c=%u ref=%d cri_st=%d path=%s name=%s\n",
+                                                  shown_count, pending_loads, f50, b5b, b5c, ref, cri_st, cri_path, nm ? nm : "?");
+                            }
+                        }
+                        node = *reinterpret_cast<const volatile uint64_t*>(node + 0x10);
+                    }
+                }
+            }
+        }
+    }
+#endif
     const bool swapped = SDL_GL_SwapWindow(window.GetSDLWindow());
     if (gles) {
         CheckSwap(swapped);

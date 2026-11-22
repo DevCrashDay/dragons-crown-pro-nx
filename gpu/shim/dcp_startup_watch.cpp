@@ -38,7 +38,13 @@ std::int64_t NowMs() {
 }
 
 std::uint32_t ThreadId() {
-    return static_cast<std::uint32_t>(gettid());
+    return static_cast<std::uint32_t>(
+#ifdef __SWITCH__
+        0
+#else
+        gettid()
+#endif
+    );
 }
 
 const char* Blocked(Wait wait, std::int64_t now, char* text, std::size_t size) {

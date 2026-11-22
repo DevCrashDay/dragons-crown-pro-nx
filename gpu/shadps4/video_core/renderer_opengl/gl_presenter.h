@@ -12,7 +12,11 @@
 #include "video_core/renderer_backend.h"
 #include "video_core/renderer_opengl/gl_api.h"
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include <SDL2/SDL_video.h>
+#else
 typedef struct SDL_GLContextState* SDL_GLContext;
+#endif
 
 namespace OpenGL {
 

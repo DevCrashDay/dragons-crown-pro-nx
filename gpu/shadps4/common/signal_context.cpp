@@ -9,6 +9,8 @@
 #elif defined(__FreeBSD__)
 #include <machine/npx.h>
 #include <sys/ucontext.h>
+#elif defined(__SWITCH__)
+// Switch uses newlib; no sys/ucontext.h
 #else
 #include <sys/ucontext.h>
 #endif
@@ -18,6 +20,9 @@ namespace Common {
 void* GetRip(void* ctx) {
 #if defined(_WIN32)
     return (void*)((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rip;
+#elif defined(__SWITCH__)
+    (void)ctx;
+    return nullptr;
 #elif defined(__APPLE__) && defined(ARCH_X86_64)
     return (void*)((ucontext_t*)ctx)->uc_mcontext->__ss.__rip;
 #elif defined(__APPLE__) && defined(ARCH_ARM64)
@@ -42,6 +47,9 @@ bool IsWriteError(void* ctx) {
     return ((ucontext_t*)ctx)->uc_mcontext.mc_err & 0x2;
 #elif defined(ARCH_X86_64)
     return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x2;
+#elif defined(__SWITCH__)
+    (void)ctx;
+    return false;
 #else
 #error "Unsupported architecture"
 #endif

@@ -30,7 +30,7 @@
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture (save pictures)
 #include "imgui_impl_opengl3.h"
-#ifdef _WIN32
+#if defined(_WIN32) || defined(DCP_SWITCH_OPENGL_ONLY)
 #include "dcp_renderer.h"
 #include "imgui_impl_gles3.h"
 #endif
@@ -71,7 +71,7 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 bool initialized = false;
 // Bare F4 quits a Boss Battle fight; any modifier (Alt+F4 closes the game) leaves it alone.
 constexpr SDL_Scancode kBossBattleQuitKey = SDL_SCANCODE_F4;
-constexpr SDL_Keymod kBossBattleQuitModifiers = SDL_KMOD_ALT | SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_GUI;
+constexpr Uint16 kBossBattleQuitModifiers = SDL_KMOD_ALT | SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_GUI;
 // The cheat menu (F10) and the Options menu (F1): open, or closing and still holding the game's input until what the
 // menu received is released. Only one of them is ever open.
 std::atomic<bool> cheat_open{false};
@@ -815,7 +815,11 @@ void InitOpenGL() {
         return;
     }
     CreateImGuiContext();
-#ifdef _WIN32
+#if defined(DCP_SWITCH_OPENGL_ONLY)
+    const char* gl_mode = std::getenv("DCP_GL_MODE");
+    const bool use_gles = gl_mode && !std::strcmp(gl_mode, "gles");
+    const bool started = InitImGuiGles3(use_gles ? "#version 300 es" : "#version 330 core");
+#elif defined(_WIN32)
     const bool started = DcpRenderer::Active() == DcpRenderer::Backend::Direct3D11
                              ? InitImGuiGles3()
                              : ImGui_ImplOpenGL3_Init("#version 330 core");
@@ -934,7 +938,11 @@ void PollChoiceInput() {
 bool HandleChoiceEvent(const SDL_Event& event) {
     int move = 0, finish = 0; // finish: 1 accept, 2 cancel
     if (event.type == SDL_EVENT_KEY_DOWN) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const SDL_Keycode key = event.key.keysym.sym;
+#else
         const SDL_Keycode key = event.key.key;
+#endif
         move = key == SDLK_UP || key == SDLK_W ? -1 : key == SDLK_DOWN || key == SDLK_S ? 1 : 0;
         finish = key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE ? 1
                  : key == SDLK_ESCAPE || key == SDLK_BACKSPACE                   ? 2
@@ -943,7 +951,11 @@ bool HandleChoiceEvent(const SDL_Event& event) {
         if (choice_input) {
             return true; // PollChoiceInput reads the gamepad
         }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const u8 button = event.cbutton.button;
+#else
         const u8 button = event.gbutton.button;
+#endif
         move = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
         finish = button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : button == SDL_GAMEPAD_BUTTON_EAST ? 2 : 0;
     } else {
@@ -973,24 +985,33 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && event.key.scancode == kBossBattleQuitKey &&
-            boss_battle_quit_key(event.key.repeat, (event.key.mod & kBossBattleQuitModifiers) != 0,
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const SDL_Scancode scancode = event.key.keysym.scancode;
+        const SDL_Keycode keycode = event.key.keysym.sym;
+        const Uint16 keymod = event.key.keysym.mod;
+#else
+        const SDL_Scancode scancode = event.key.scancode;
+        const SDL_Keycode keycode = event.key.key;
+        const SDL_Keymod keymod = event.key.mod;
+#endif
+        if (down && scancode == kBossBattleQuitKey &&
+            boss_battle_quit_key(event.key.repeat, (keymod & kBossBattleQuitModifiers) != 0,
                                  MenuOpen() || text_entry_active || choice_active)) {
             return true;
         }
-        if (event.key.scancode == DcpSettings::Get().menu_key) {
+        if (scancode == DcpSettings::Get().menu_key) {
             if (down) {
                 PressCheatMenuKey(event.key.repeat);
             }
             return true;
         }
-        if (event.key.scancode == DcpOptions::kKey) {
+        if (scancode == DcpOptions::kKey) {
             if (down) {
                 PressOptionsMenuKey(event.key.repeat);
             }
             return true;
         }
-        if (MenuOpen() && event.key.key == SDLK_ESCAPE && down) {
+        if (MenuOpen() && keycode == SDLK_ESCAPE && down) {
             if (!event.key.repeat) {
                 menu_close.Request();
             }
@@ -999,10 +1020,10 @@ bool HandleEvent(const SDL_Event& event) {
         if (!MenuOpen()) {
             return false;
         }
-        io.AddKeyEvent(ImGuiMod_Ctrl, (event.key.mod & SDL_KMOD_CTRL) != 0);
-        io.AddKeyEvent(ImGuiMod_Shift, (event.key.mod & SDL_KMOD_SHIFT) != 0);
-        io.AddKeyEvent(ImGuiMod_Alt, (event.key.mod & SDL_KMOD_ALT) != 0);
-        if (const ImGuiKey key = KeyFromSdl(event.key.key); key != ImGuiKey_None) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, (keymod & SDL_KMOD_CTRL) != 0);
+        io.AddKeyEvent(ImGuiMod_Shift, (keymod & SDL_KMOD_SHIFT) != 0);
+        io.AddKeyEvent(ImGuiMod_Alt, (keymod & SDL_KMOD_ALT) != 0);
+        if (const ImGuiKey key = KeyFromSdl(keycode); key != ImGuiKey_None) {
             io.AddKeyEvent(key, down);
         }
         return true;
@@ -1010,25 +1031,41 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         const bool down = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-        if (DcpOptionsUi::TrackChord(event.gbutton.which, event.gbutton.button, down)) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const auto which = event.cbutton.which;
+        const auto btn = static_cast<SDL_GamepadButton>(event.cbutton.button);
+#else
+        const auto which = event.gbutton.which;
+        const auto btn = static_cast<SDL_GamepadButton>(event.gbutton.button);
+#endif
+        if (DcpOptionsUi::TrackChord(which, btn, down)) {
             PressOptionsMenuKey(false);
         }
         if (!MenuOpen()) {
             return false;
         }
-        if (const ImGuiKey key = KeyFromGamepad(event.gbutton.button); key != ImGuiKey_None) {
+        if (const ImGuiKey key = KeyFromGamepad(btn); key != ImGuiKey_None) {
             io.AddKeyEvent(key, down);
         }
         return true;
     }
     case SDL_EVENT_GAMEPAD_REMOVED:
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        DcpOptionsUi::ForgetPad(event.cdevice.which);
+#else
         DcpOptionsUi::ForgetPad(event.gdevice.which);
+#endif
         return false;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
-        if (MenuOpen() && (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX || event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        const auto& axis = event.caxis;
+#else
+        const auto& axis = event.gaxis;
+#endif
+        if (MenuOpen() && (axis.axis == SDL_GAMEPAD_AXIS_LEFTX || axis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
             constexpr float kStickDeadZone = 0.25f;
-            const float amount = event.gaxis.value / 32767.0f;
-            const bool vertical = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+            const float amount = axis.value / 32767.0f;
+            const bool vertical = axis.axis == SDL_GAMEPAD_AXIS_LEFTY;
             const ImGuiKey negative = vertical ? ImGuiKey_GamepadLStickUp : ImGuiKey_GamepadLStickLeft;
             const ImGuiKey positive = vertical ? ImGuiKey_GamepadLStickDown : ImGuiKey_GamepadLStickRight;
             const bool up = amount < -kStickDeadZone, down = amount > kStickDeadZone;
@@ -1244,7 +1281,11 @@ void RenderOpenGL(u32 width, u32 height) {
         return;
     }
     std::scoped_lock lock{imgui_mutex};
-#ifdef _WIN32
+#if defined(DCP_SWITCH_OPENGL_ONLY)
+    BuildFrame(width, height, ImGuiGles3NewFrame);
+    ImGuiGles3RenderDrawData(ImGui::GetDrawData());
+    return;
+#elif defined(_WIN32)
     if (DcpRenderer::Active() == DcpRenderer::Backend::Direct3D11) {
         BuildFrame(width, height, ImGuiGles3NewFrame);
         ImGuiGles3RenderDrawData(ImGui::GetDrawData());

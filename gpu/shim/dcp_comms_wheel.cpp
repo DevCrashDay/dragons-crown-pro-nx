@@ -104,7 +104,11 @@ bool HandleEvent(const SDL_Event& event) {
         return (g_captured_buttons.fetch_and(~bit) & bit) != 0;
     }
     case SDL_EVENT_KEY_DOWN:
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        if (!engaged || event.key.keysym.scancode != SDL_SCANCODE_ESCAPE) {
+#else
         if (!engaged || event.key.scancode != SDL_SCANCODE_ESCAPE) {
+#endif
             return false;
         }
         g_cancel_click = true;
@@ -220,7 +224,7 @@ extern "C" void dcpgpu_comms_wheel_step(const DcpCommsPadIn* in, DcpCommsPadOut*
     inputs.circle = in->circle != 0;
     inputs.confirm = in->cross != 0;
     inputs.nav = static_cast<uint8_t>(in->nav);
-    const bool* keys = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(nullptr) : nullptr;
+    const auto* keys = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(nullptr) : nullptr;
     const int scancode = DcpSettings::Get().comms_key;
     inputs.key_down = keys && scancode > SDL_SCANCODE_UNKNOWN && scancode < SDL_SCANCODE_COUNT && keys[scancode];
     if (!g_driver.KeyboardEngaged()) {
