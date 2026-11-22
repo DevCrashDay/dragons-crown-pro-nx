@@ -12,6 +12,10 @@ typedef struct NxX64Context NxX64Context;
 NxX64Context *nx_x64_create(void *mem_base, size_t mem_size);
 void nx_x64_destroy(NxX64Context *ctx);
 
+/* Tell the dynarec that [addr, addr + size) is final guest code (R+X); without it nothing is
+   compiled and everything runs in the interpreter. */
+void nx_x64_mark_code(NxX64Context *ctx, void *addr, size_t size);
+
 /* Register an HLE host thunk at guest stub address `guest_stub` for PS4 import `name`. */
 void nx_x64_register_import(NxX64Context *ctx, uint64_t guest_stub, const char *name, void *host_fn);
 

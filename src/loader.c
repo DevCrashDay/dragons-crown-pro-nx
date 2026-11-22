@@ -1368,6 +1368,8 @@ int main(int argc, char **argv) {
 #ifdef __SWITCH__
     NxX64Context *x64 = nx_x64_create(image, round_page(size));
     if (!x64) fail("Box64 context creation failed");
+    for (uint64_t i = 0; i < ns; ++i)
+        if (segments[i].flags & 1) nx_x64_mark_code(x64, image + segments[i].address, round_page(segments[i].size));
     unsigned char *main_stack = (unsigned char *)calloc(1, 8 * 1024 * 1024);
     if (!main_stack) fail("cannot allocate guest main stack");
     uint64_t stack_top = (uint64_t)(uintptr_t)(main_stack + 8 * 1024 * 1024 - 64);
@@ -1411,6 +1413,7 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
 #ifdef __SWITCH__
     nx_platform_trace("Entry: entering guest at 0x%llx\n", (unsigned long long)entry);
+    nx_platform_thread_setup("main", 700);
 #endif
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

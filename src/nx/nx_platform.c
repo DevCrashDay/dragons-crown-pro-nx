@@ -53,10 +53,47 @@ static void load_ini(void) {
         char name[160];
         snprintf(name, sizeof name, "DCP_%s", key);
         setenv(name, value, 1);
+        if (!strncmp(key, "BOX64_", 6)) setenv(key, value, 1); /* Box64 reads its own names */
         ++count;
     }
     fclose(f);
     if (count) printf("Switch: %u settings from nx.ini\n", count);
+}
+
+/* libnx pthreads inherit the creator's priority and the process default core, so every guest
+ * thread lands on one core at one priority. Horizon never time-slices equal priorities (only
+ * priority 59 on cores 0-2 is rotated every 10 ms), so one polling guest thread starves the rest.
+ * NX_SCHED: off = libnx default; spread = priority 59 on cores 0-2; mapped = PS4 256..767 -> 44..59
+ * on cores 0-2. Always logs where the thread runs. */
+void nx_platform_thread_setup(const char *name, int ps4_prio) {
+#ifdef __SWITCH__
+    static int next_index;
+    const char *mode = getenv("DCP_NX_SCHED");
+    int core0 = (int)svcGetCurrentProcessorNumber();
+    s32 prio0 = -1;
+    svcGetThreadPriority(&prio0, CUR_THREAD_HANDLE);
+    Result rc_mask = 0, rc_prio = 0;
+    if (mode && (!strcmp(mode, "spread") || !strcmp(mode, "mapped"))) {
+        int index = __atomic_fetch_add(&next_index, 1, __ATOMIC_RELAXED);
+        s32 prio = 59;
+        if (!strcmp(mode, "mapped")) {
+            int p = ps4_prio < 256 ? 256 : ps4_prio > 767 ? 767 : ps4_prio;
+            prio = 44 + (p - 256) * 15 / 511;
+        }
+        rc_mask = svcSetThreadCoreMask(CUR_THREAD_HANDLE, index % 3, 0x7);
+        rc_prio = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
+        svcSleepThread(-1); /* yield with core migration so the new ideal core takes effect */
+    }
+    s32 prio1 = -1;
+    svcGetThreadPriority(&prio1, CUR_THREAD_HANDLE);
+    nx_platform_trace("Sched: '%s' ps4=%d core %d->%d prio %d->%d mode=%s rc=0x%x/0x%x\n", name ? name : "?",
+                      ps4_prio, core0, (int)svcGetCurrentProcessorNumber(), (int)prio0, (int)prio1,
+                      mode ? mode : "off", (unsigned)rc_mask, (unsigned)rc_prio);
+    extern void nx_hle_thread_begin(const char *name);
+    nx_hle_thread_begin(name);
+#else
+    (void)name; (void)ps4_prio;
+#endif
 }
 
 int nx_platform_safe_mode(void) {
@@ -84,6 +121,7 @@ void nx_platform_trace(const char *format, ...) {
 #ifdef __SWITCH__
     FILE *f = fopen("sdmc:/switch/dragons_crown_pro/logs/bringup.log", "a");
     if (f) {
+        fprintf(f, "%8llu ", (unsigned long long)(armTicksToNs(armGetSystemTick()) / 1000000ULL));
         fputs(line, f);
         fclose(f);
     }

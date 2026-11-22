@@ -134,6 +134,31 @@ index bef439c..c43fe38 100644
      helper.table64cap = helper.table64size;
      helper.table64 = (uint64_t*)helper.tablestart;
      helper.callrets = (callret_t*)callrets;
+diff --git a/src/dynarec/dynarec.c b/src/dynarec/dynarec.c
+index 3241e68..a8dd7b4 100644
+--- a/src/dynarec/dynarec.c
++++ b/src/dynarec/dynarec.c
+@@ -278,6 +278,10 @@ void EmuRun(x64emu_t* emu, int use_dynarec, int no_alt)
+                 skip = 0;
+                 if (BOX64ENV(dynarec_test))
+                     emu->test.clean = 0;
++                #ifdef __SWITCH__
++                { extern uint64_t nx_dyn_stat_interp; extern uintptr_t nx_dyn_last_interp;
++                  __atomic_add_fetch(&nx_dyn_stat_interp, 1, __ATOMIC_RELAXED); nx_dyn_last_interp = R_RIP; }
++                #endif
+                 Run(emu, 1);
+             } else {
+                 dynarec_log(LOG_DEBUG, "%04d|Running DynaRec Block @%p (%p) of %d x64 insts (hash=0x%x) emu=%p\n", GetTID(), (void*)R_RIP, block->block, block->isize, block->hash, emu);
+@@ -289,6 +293,9 @@ void EmuRun(x64emu_t* emu, int use_dynarec, int no_alt)
+                 if(!jblock) {
+                     skip = 1;
+                 } else {
++                    #ifdef __SWITCH__
++                    { extern uint64_t nx_dyn_stat_block; __atomic_add_fetch(&nx_dyn_stat_block, 1, __ATOMIC_RELAXED); }
++                    #endif
+                     native_prolog(emu, jblock);
+                 }
+             }
 diff --git a/src/dynarec/dynarec_native.c b/src/dynarec/dynarec_native.c
 index d9a51ef..4948820 100644
 --- a/src/dynarec/dynarec_native.c

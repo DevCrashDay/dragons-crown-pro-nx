@@ -18,6 +18,10 @@ int nx_platform_has_nxlink(void);
    Safe mode disables the port's guest-hook features and is the default on Switch. */
 int nx_platform_safe_mode(void);
 
+/* Called on each guest thread (and the main thread) before guest code: applies NX_SCHED and logs
+   the thread's core and priority. */
+void nx_platform_thread_setup(const char *name, int ps4_prio);
+
 /* Appends one line to sdmc:/switch/dragons_crown_pro/logs/bringup.log and to stdout.
    Works before the runtime log exists, so an early exit still leaves a reason on the SD. */
 void nx_platform_trace(const char *format, ...);

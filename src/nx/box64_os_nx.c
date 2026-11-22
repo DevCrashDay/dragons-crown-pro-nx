@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <switch.h>
 
 #include "x64_exec.h"
@@ -97,6 +99,96 @@ int g_nx_trace_loop = 0;
 uint64_t g_nx_image_base = 0;
 __thread int g_nx_guest_worker_id = 0;
 
+/* Stall watchdog (nx.ini STALL_DUMP=1): every guest thread owns a slot holding its current HLE call;
+ * a host thread dumps all slots every 5 s, so a hang shows who waits on what and for how long. */
+typedef struct {
+    const char *thread, *hle, *last_hle;
+    uint64_t a0, a1, a2, ret_ip, t_enter, last_ret, calls, calls_seen;
+    volatile int in_call, alive;
+    x64emu_t *emu; /* registers are exact with DYNAREC=0; the dynarec only syncs them at block exits */
+} NxHleSlot;
+static NxHleSlot g_hle_slots[96];
+uint64_t nx_dyn_stat_block, nx_dyn_stat_interp; /* DynaRun: native blocks entered vs interpreter fallbacks */
+uintptr_t nx_dyn_last_interp;
+static __thread NxHleSlot *t_hle_slot;
+static int g_stall_dump = -1;
+
+static uint64_t nx_now_ms(void) { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
+
+static void *stall_dump_thread(void *unused) {
+    (void)unused;
+    extern void nx_platform_trace(const char *format, ...);
+    for (;;) {
+        svcSleepThread(5000000000LL);
+        uint64_t now = nx_now_ms();
+        static uint64_t seen_block, seen_interp;
+        uint64_t nb = nx_dyn_stat_block, ni = nx_dyn_stat_interp;
+        uint64_t li = nx_dyn_last_interp;
+        nx_platform_trace("STALL dump t=%llums dynarec=%d blocks +%llu interp +%llu (last interp @0x%llx)\n",
+                          (unsigned long long)now, (int)BOX64ENV(dynarec), (unsigned long long)(nb - seen_block),
+                          (unsigned long long)(ni - seen_interp),
+                          (unsigned long long)((g_nx_image_base && li >= g_nx_image_base) ? li - g_nx_image_base : li));
+        seen_block = nb; seen_interp = ni;
+        for (int i = 0; i < (int)(sizeof g_hle_slots / sizeof *g_hle_slots); ++i) {
+            NxHleSlot *s = &g_hle_slots[i];
+            if (!s->alive) continue;
+            uint64_t calls = s->calls, delta = calls - s->calls_seen;
+            s->calls_seen = calls;
+            uint64_t rel = (g_nx_image_base && s->ret_ip >= g_nx_image_base) ? s->ret_ip - g_nx_image_base : s->ret_ip;
+            if (s->in_call)
+                nx_platform_trace("  [%d] %s: IN %s(0x%llx, 0x%llx, 0x%llx) for %llums @0x%llx, +%llu calls\n", i,
+                                  s->thread, s->hle, (unsigned long long)s->a0, (unsigned long long)s->a1,
+                                  (unsigned long long)s->a2, (unsigned long long)(now - s->t_enter),
+                                  (unsigned long long)rel, (unsigned long long)delta);
+            else
+                nx_platform_trace("  [%d] %s: guest code, +%llu calls, last %s -> 0x%llx @0x%llx\n", i, s->thread,
+                                  (unsigned long long)delta, s->last_hle ? s->last_hle : "-",
+                                  (unsigned long long)s->last_ret, (unsigned long long)rel);
+            /* A thread in guest code with no HLE calls: sample where it is, to tell a loop from work. */
+            if (!s->in_call && !delta && s->emu) {
+                x64emu_t *emu = s->emu;
+                for (int k = 0; k < 6; ++k) {
+                    uint64_t rip = R_RIP;
+                    uint64_t r = (g_nx_image_base && rip >= g_nx_image_base) ? rip - g_nx_image_base : rip;
+                    nx_platform_trace("      rip=0x%llx rax=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx\n",
+                                      (unsigned long long)r, (unsigned long long)R_RAX, (unsigned long long)R_RCX,
+                                      (unsigned long long)R_RDX, (unsigned long long)R_RSI, (unsigned long long)R_RDI,
+                                      (unsigned long long)R_R8, (unsigned long long)R_R9);
+                    svcSleepThread(30000000LL);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+void nx_hle_thread_begin(const char *name) {
+    if (g_stall_dump < 0) {
+        const char *e = getenv("DCP_STALL_DUMP");
+        g_stall_dump = (e && *e && strcmp(e, "0")) ? 1 : 0;
+        if (g_stall_dump) {
+            pthread_t th;
+            pthread_create(&th, NULL, stall_dump_thread, NULL);
+        }
+    }
+    if (!g_stall_dump) return;
+    mutexLock(&bridge_lock);
+    for (int i = 0; i < (int)(sizeof g_hle_slots / sizeof *g_hle_slots); ++i) {
+        if (g_hle_slots[i].alive) continue;
+        memset(&g_hle_slots[i], 0, sizeof g_hle_slots[i]);
+        g_hle_slots[i].thread = name ? name : "?";
+        g_hle_slots[i].alive = 1;
+        t_hle_slot = &g_hle_slots[i];
+        break;
+    }
+    mutexUnlock(&bridge_lock);
+}
+
+void nx_hle_thread_end(void) {
+    if (t_hle_slot) t_hle_slot->alive = 0;
+    t_hle_slot = NULL;
+}
+
 /* Interpreter INT3 and the dynarec's generic bridge path both land here. *addr = address after the CC. */
 void EmuInt3(void *opaque, void *a) {
     x64emu_t *emu = (x64emu_t *)opaque;
@@ -147,7 +239,21 @@ void EmuInt3(void *opaque, void *a) {
         R_RIP = (uintptr_t)(b + 19);
         uint64_t arg0 = R_RDI, arg1 = R_RSI, arg2 = R_RDX;
         uint64_t ret_ip = R_RSP ? *(uint64_t *)(uintptr_t)R_RSP : 0;
+        NxHleSlot *slot = t_hle_slot;
+        if (slot) {
+            slot->emu = emu;
+            slot->hle = nptr ? (const char *)nptr : "?";
+            slot->a0 = arg0; slot->a1 = arg1; slot->a2 = arg2; slot->ret_ip = ret_ip;
+            slot->t_enter = nx_now_ms();
+            slot->in_call = 1;
+        }
         ((wrapper_t)w)(emu, fn);
+        if (slot) {
+            slot->in_call = 0;
+            slot->last_hle = slot->hle;
+            slot->last_ret = R_RAX;
+            ++slot->calls;
+        }
         if (g_nx_guest_worker_id > 0 && nptr) {
             const char *nm = (const char *)nptr;
             if (strcmp(nm, "memcpy") && strcmp(nm, "memset") && strcmp(nm, "memmove") &&
@@ -308,6 +414,15 @@ NxX64Context *nx_x64_create(void *mem_base, size_t mem_size) {
     ctx->mem_base = mem_base;
     ctx->mem_size = mem_size;
     return ctx;
+}
+
+/* The dynarec only builds blocks for memory its memprot map knows as PROT_READ|PROT_EXEC. On Linux
+ * Box64's mmap wrappers fill that map; here the loader maps the image itself, so without this every
+ * block is refused and DynaRun silently interprets everything. mprotect is a no-op on Switch, so
+ * Box64 cannot detect later writes to these pages: only code that is final at load time belongs here. */
+void nx_x64_mark_code(NxX64Context *ctx, void *addr, size_t size) {
+    (void)ctx;
+    setProtection_elf((uintptr_t)addr, size, PROT_READ | PROT_EXEC);
 }
 
 void nx_x64_destroy(NxX64Context *ctx) { free(ctx); }

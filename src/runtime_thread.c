@@ -9,6 +9,7 @@
 #include "runtime.h"
 #ifdef __SWITCH__
 #include "nx/x64_exec.h"
+#include "nx/nx_platform.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -328,6 +329,7 @@ static void *host_start(void *p) {
     attach(t);
     set_host_name(t->name);
 #ifdef __SWITCH__
+    nx_platform_thread_setup(t->name, t->attr.prio);
     extern __thread int g_nx_guest_worker_id;
     static int g_next_worker_id = 0;
     if (!strcmp(t->name, "guest")) {
@@ -338,6 +340,8 @@ static void *host_start(void *p) {
         t->result=(void *)(uintptr_t)nx_x64_call(NULL,(uint64_t)(uintptr_t)t->entry,
             (uint64_t)(uintptr_t)(t->stack+t->stack_size),0,(uint64_t)(uintptr_t)t->argument,0,0,0);
     g_nx_guest_worker_id = 0;
+    extern void nx_hle_thread_end(void);
+    nx_hle_thread_end();
 #else
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
 #endif
