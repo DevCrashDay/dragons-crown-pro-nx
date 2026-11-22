@@ -12,12 +12,46 @@ Last updated: 2026-11-22. Branch: `switch-port`. This is the only handoff docume
   interpreter), GL 4.3 core on Mesa nouveau, 3 module initializers, guest entry, 4 pads, runtime log
   (`logs/dragons_crown_pro_NNN.log`) and `logs/bringup.log`. All 90 HLE imports reached return success
   (except expected `sceNetCtlGetInfo` offline and `scePthreadCancel` ESRCH on a finished thread).
-- **Current stop:** 1 draw/frame loop (`vs 0x4c12efc8, ps 0xdd6a0825`, `max=0`). Boot task loads files at
-  **~1 file per second**, then stalls forever at `reads=47 (29840 KiB) pending=4`. Never reaches
-  boot-task State 4 (`sceFontOpenFontSet` → `Font: system font set`), `SAVEDATA00` or real rendering.
-  PC v1.4.0 with the same game data reaches `Font: system font set 0x1807a444` immediately.
+- **2026-11-22 evening: boots to the title screen in Ryujinx** (default `nx.ini`: `NX_SAFE=1`,
+  `AUDIO=none`). Verified with frame dumps: CRIWARE logo → Dragon's Crown Pro logo → class intro
+  (Elf, Sorceress, ...) → title screen (`©ATLUS ©SEGA`) → attract loop. `Font: system font set`,
+  `SAVEDATA00` created/written, 300 s runs without a crash, ~20 fps in Ryujinx.
+- **What fixed it** (details in §1.1):
+  1. The Box64 dynarec had never run a single block: Box64 only compiles memory its memprot map knows
+     as R+X, and nothing registered the loader's image. Everything was interpreted (the earlier
+     "dynarec on" claims were wrong), so the CRILAYLA decompressor ran at ~24 KB/s and the boot task
+     looked stalled at `pending=4`. Fixed in `nx_x64_mark_code` (`src/nx/box64_os_nx.c`), called for
+     every executable segment from `src/loader.c`.
+  2. Guest pool 2304+256 MiB left Mesa too little memory: `GL_OUT_OF_MEMORY`, then a crash in
+     `glFramebufferTexture2D` (Mesa 20.1 NULL deref on a texture without storage) and later a C++
+     throw. Defaults are now 2176 MiB direct + 32 MiB flexible (game uses 2089 / 0.25 MiB);
+     attachments are guarded (`Rasterizer::AttachImage`).
 
-## 1. Stall analysis
+### 0.1 Open issues (next work, Ryujinx)
+1. **Input on the title screen is untested** (press A/Start in Ryujinx → new game → first stage).
+2. **`GL_OUT_OF_MEMORY` (0x505) still recurs** every few seconds after ~frame 700 although the heap has
+   300–500 MiB free → one specific GL allocation fails (large or fragmented). Add a KHR_debug callback
+   (`glDebugMessageCallback`, GL 4.3 core) to name the call.
+3. **Intermittent freeze**: 1 of ~8 runs stopped presenting at frame 139 (~17 s, `pending=43`) with no
+   Ryujinx error. Reproduce with `STALL_DUMP=1` and read the dump.
+4. **Any C++ throw crashes in Ryujinx**: libgcc's unwinder runs `mov x16,#1; chkfeat x16; cbnz x16`
+   before `mrs gcspr_el0`; Ryujinx 1.3.3 leaves x16=0 and then aborts on the unknown MRS. On the
+   Switch's Cortex-A57 `chkfeat` is an architectural NOP, so hardware skips the MRS. If throws become
+   common, patch the 5 `chkfeat` (0xd503251f) in libgcc's unwinder to `nop` after linking.
+5. Phase 5 gate below (SoftwarePageTable run, `DYNAREC_STRONGMEM`, RAM margin) before hardware.
+
+## 1. Stall analysis (historical, solved)
+
+### 1.1 Root cause
+`STALL_DUMP=1` showed every CRI thread idle except `CRI FS Data Decompression 0`, which stayed in guest
+code with zero HLE calls for minutes; sampled registers showed it in the CRILAYLA loop (`0x62cfd0`)
+with the output pointer advancing ~24 KB/s. Dynarec and interpreter runs had identical timings, and a
+counter in `DynaRun` showed `blocks +0 interp +1.5M` per 5 s: the dynarec refused every block because
+`FillBlock64` requires `PROT_READ|PROT_EXEC` in Box64's memprot map. The analysis below was written
+before this was found; H1 (scheduler) was tested and refuted (guest threads already run at priority
+59 spread over cores 0–2).
+
+### 1.2 Original analysis
 
 Timeline (`bringup.log`, 2026-11-22 17:52): `R#17` @frame 9 → `R#18` @60 → `R#19` @120 → `R#20..27` by
 180 → `R#28..42` by 240 → none until 300 → `R#43..47` by 360 → none after. PC creates its `'guest'`
@@ -65,34 +99,27 @@ Game-side detail (from static analysis of `boot.bin`, kept for reference):
 - Port committed on `switch-port`; Box64 patch regenerated (6 files, upstream commit in its header);
   parent-folder logs/slices archived; handoffs merged.
 
-### Phase 1 — Repeatable Ryujinx loop
-- `tools/ryu_run.ps1`: build → copy `.nro` → write `nx.ini` → truncate `bringup.log` → launch Ryujinx
-  → stop at success marker or timeout → copy logs to `runs\<ts>-<label>\` → one-line summary.
-- Success markers: `Font: system font set`, `SAVEDATA00`, `max=` > 0, later the title screen.
-- Ryujinx config: turbo/`TickScalar` inactive; `HostMappedUnsafe` hides permission faults (Phase 5).
+### Phase 1 — Repeatable Ryujinx loop (done)
+- `powershell -ExecutionPolicy Bypass -File tools\ryu_run.ps1 -Label x -Seconds 240 -StopMarker NEVER
+  -Ini 'KEY=V,KEY2=V2'` → build, deploy, run, logs + frame dumps in `runs\<ts>-<label>\`, summary line.
+  `-NoBuild` skips the build; the default stop marker is `Font: system font set`.
 
-### Phase 2 — Platform instrumentation (reusable)
-- Thread census in `host_start` (`src/runtime_thread.c`): name, PS4 priority, core, Horizon priority.
-- Stall watchdog (`STALL_DUMP=1`): per-thread current HLE call + args + time in call + guest RIP,
-  dumped every 5 s. Set in the HLE dispatch (`src/nx/box64_os_nx.c`).
-- Sync ledger (`DCP_TRACE_SYNC=1`): ring buffer of sema/eventflag/cond/mutex ops, dumped by the watchdog.
-- PC baseline with `DCP_FILE_TRACE=1 DCP_TRACE_SEMA=1`; diff against Switch.
-- Replace the hardcoded `R#17..60` read logs with one knob; put `fs_mgr`/PEND probes behind a flag.
+### Phase 2 — Platform instrumentation (done; nx.ini knobs)
+- `STALL_DUMP=1`: every 5 s, dynarec block/interpreter counts plus per-thread current HLE call, args,
+  time in call, call rate; threads in guest code without HLE calls get 6 register samples.
+- `FRAME_DUMP=N`: every N-th presented frame (multiple of 60) as a quarter-size BMP in `logs/`.
+- Thread census `Sched:` lines; `NX_SCHED=spread|mapped` (no effect on the old stall; keep for HW).
+- `BOX64_*` keys pass through to Box64 unchanged. bringup.log lines carry ms timestamps; the presenter
+  line reports `heap_free`.
+- Not done (not needed so far): sync ledger, sync/clock self-tests, PC baseline diff, CRC read trace.
+- Still to clean: hardcoded `R#17..60` read logs, `fs_mgr`/PEND probes in `gl_presenter.cpp`.
 
-### Phase 3 — A/B experiments (one run each)
-1. `NX_SCHED=spread`: guest threads on cores 0–2 (mask `0x7`), priority 59. Variant `mapped`: PS4
-   256..767 → Horizon 44..59.
-2. Unsplit CPK: hardlink the original `DRACRO.CPK` into the Ryujinx `game\` dir (base file wins);
-   optional per-read CRC32 trace checked against the original file.
-3. `X64_SELFTEST=sync`: cond timedwait accuracy (MONOTONIC attr), cross-core signal/broadcast,
-   recursive/errorcheck mutex semantics, sema/eventflag, sleep accuracy, `sched_yield` fairness.
-4. Clocks: guest `rdtsc` over 1 s vs `tsc_frequency()` / process time (ratio 1.00 ± 1%).
-5. Only if 1–4 don't move it: Box64 AVX off, `DYNAREC_SAFEFLAGS=2`, `DYNAREC_STRONGMEM=1`.
-- Make the fix that moves the stall the default; keep the knob for A/B.
+### Phase 3 — A/B experiments (done)
+- Scheduler spread: no change. Dynarec counters → root cause (§1.1).
 
 ### Phase 4 — Ryujinx milestones
-- `pending=0` → `Font: system font set` → `SAVEDATA00` round-trip → logos/title (`max>0`) → input on
-  title → new game → first playable area → 30-min soak, peak RAM logged.
+- Done: `pending=0`, `Font: system font set`, `SAVEDATA00` write, logos/title (`max>0`).
+- Next: open issues §0.1 → input on title → new game → first playable area → 30-min soak.
 - `NX_SAFE=0` features one by one later (needs >4-arg/XMM host→guest marshalling, §7).
 
 ### Phase 5 — Ryujinx gate before hardware
@@ -134,7 +161,9 @@ Switch port choices:
 - **Safe mode is the default.** `NX_SAFE=1` skips all guest-hook features and clears the GPU feature
   bits. `NX_SAFE=0` enables them.
 - **`nx.ini`**: each `KEY=VALUE` line becomes `DCP_KEY`. Keys: `NX_SAFE`, `NX_DMEM_MB`, `NX_FMEM_MB`,
-  `AUDIO`, `PAD_MAP`, `GPU_PROBE`, `X64_SELFTEST`, `CPU_ONLY`, `CHECK_IMPORTS`, `DYNAREC`, `TRACE_HLE`.
+  `AUDIO`, `PAD_MAP`, `GPU_PROBE`, `X64_SELFTEST`, `CPU_ONLY`, `CHECK_IMPORTS`, `DYNAREC`, `TRACE_HLE`,
+  `STALL_DUMP`, `FRAME_DUMP`, `NX_SCHED`; `BOX64_*` keys are also passed to Box64 under their own name.
+- **Pool defaults**: 2176 MiB direct + 32 MiB flexible (override with `NX_DMEM_MB` / `NX_FMEM_MB`).
 - **Split files**: a missing `NAME` opens `NAME.000`, `NAME.001`, ... as one read-only file. The base
   file wins if present.
 - **Logs**: `logs/bringup.log` (early stages, every `fail()`, presenter milestones) and the normal
