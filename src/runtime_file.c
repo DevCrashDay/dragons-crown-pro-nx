@@ -509,16 +509,8 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
                              : split_pread(f->split,buffer,size,at);
         if (n>0) f->split_pos+=n;
         if (n>0) {
-            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
             __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-            if (rc >= 17 && rc <= 60) {
-                extern void nx_platform_trace(const char *format, ...);
-                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                                  (unsigned long long)rc, fd, (unsigned long long)at,
-                                  (unsigned long long)size, (long long)n);
-            }
-#endif
         }
         observe_read(fd,at,n);
         return n;
@@ -531,16 +523,8 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
         int64_t n=overlay_pread(f,buffer,size,at);
         if (n>0 && host_lseek(h,at+n,SEEK_SET)<0) return -errno;
         if (n>0) {
-            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
             __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-            if (rc >= 17 && rc <= 60) {
-                extern void nx_platform_trace(const char *format, ...);
-                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                                  (unsigned long long)rc, fd, (unsigned long long)at,
-                                  (unsigned long long)size, (long long)n);
-            }
-#endif
         }
         observe_read(fd,at,n);
         return n;
@@ -548,18 +532,8 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     const int64_t at=observed_position(fd,h);
     ssize_t n=host_read(h,buffer,size);
     if (n<0) return -errno;
-    {
-        uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
-        __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-        if (rc >= 17 && rc <= 60) {
-            extern void nx_platform_trace(const char *format, ...);
-            nx_platform_trace("R#%llu(read): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                              (unsigned long long)rc, fd, (unsigned long long)at,
-                              (unsigned long long)size, (long long)n);
-        }
-#endif
-    }
+    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     observe_read(fd,at,n);
     return n;
 }
@@ -575,16 +549,8 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
         int64_t n=f->overlay ? overlay_pread(f,buffer,size,offset)
                              : split_pread(f->split,buffer,size,offset);
         if (n>0) {
-            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
             __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-            if (rc >= 17 && rc <= 60) {
-                extern void nx_platform_trace(const char *format, ...);
-                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                                  (unsigned long long)rc, fd, (unsigned long long)offset,
-                                  (unsigned long long)size, (long long)n);
-            }
-#endif
         }
         observe_read(fd,offset,n);
         return n;
@@ -594,34 +560,16 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (f->overlay) {
         int64_t n=overlay_pread(f,buffer,size,offset);
         if (n>0) {
-            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
             __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-            if (rc >= 17 && rc <= 60) {
-                extern void nx_platform_trace(const char *format, ...);
-                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                                  (unsigned long long)rc, fd, (unsigned long long)offset,
-                                  (unsigned long long)size, (long long)n);
-            }
-#endif
         }
         observe_read(fd,offset,n);
         return n;
     }
     ssize_t n=pread(h,buffer,size,offset);
     if (n<0) return -errno;
-    {
-        uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
-        __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-#ifdef __SWITCH__
-        if (rc >= 17 && rc <= 60) {
-            extern void nx_platform_trace(const char *format, ...);
-            nx_platform_trace("R#%llu(pread): fd=%d off=0x%llx sz=%llu ret=%lld\n",
-                              (unsigned long long)rc, fd, (unsigned long long)offset,
-                              (unsigned long long)size, (long long)n);
-        }
-#endif
-    }
+    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     observe_read(fd,offset,n);
     return n;
 }

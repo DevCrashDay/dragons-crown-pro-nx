@@ -53,9 +53,13 @@ if (-not (Test-Path $Ini)) {
 # Dragons Crown Pro (Switch). Each KEY=VALUE becomes DCP_KEY, the same knob the PC build reads.
 # NX_SAFE=0 turns the port's guest-hook features back on (cheats, boss battle, online, ...).
 NX_SAFE=1
-# NX_DMEM_MB=2304
-# NX_FMEM_MB=448
+# Defaults: 2176 MiB direct + 32 MiB flexible, 800 MiB large arena, BOX64_DYNAREC_STRONGMEM=1, libnx audout.
+# NX_DMEM_MB=2176
+# NX_FMEM_MB=32
+# NX_LARGE_ARENA_MB=800
+# BOX64_DYNAREC_STRONGMEM=1
 # AUDIO=none
+# PAD_MAP=cross=b,circle=a
 # GPU_PROBE=1
 # X64_SELFTEST=1
 "@ | Set-Content -Encoding ASCII $Ini

@@ -350,6 +350,8 @@ static int box64_ready;
 
 static void box64_process_init(void) {
     if (box64_ready) return;
+    /* ARM64 hardware has weak memory ordering (unlike x86/Ryujinx TSO); default strongmem=1 unless overridden. */
+    setenv("BOX64_DYNAREC_STRONGMEM", "1", 0);
     LoadEnvVariables();
     InitializeEnvFiles();
     InitializeSystemInfo();

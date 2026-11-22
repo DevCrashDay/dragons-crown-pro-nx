@@ -5,40 +5,70 @@ Last updated: 2026-11-22. Branch: `switch-port`. This is the only handoff docume
 
 ## 0. Status
 
-- **Goal:** boot to the title screen in Ryujinx 1.3.3, then hand over to hardware.
+- **Goal:** full playable build in Ryujinx (Canary 1.3.354), then hand over to Switch hardware.
 - **Build:** `build-nx/dragons_crown_pro.nro` builds cleanly (`tools/build_nx.ps1`), synced to
   `%APPDATA%\Ryujinx\sdcard\switch\dragons_crown_pro\dragons_crown_pro.nro`.
-- **Works (Ryujinx and hardware):** paths, `DCPBOOT1`, 2304+256 MiB guest pool, Box64 (dynarec and
-  interpreter), GL 4.3 core on Mesa nouveau, 3 module initializers, guest entry, 4 pads, runtime log
-  (`logs/dragons_crown_pro_NNN.log`) and `logs/bringup.log`. All 90 HLE imports reached return success
-  (except expected `sceNetCtlGetInfo` offline and `scePthreadCancel` ESRCH on a finished thread).
-- **2026-11-22 evening: boots to the title screen in Ryujinx** (default `nx.ini`: `NX_SAFE=1`,
-  `AUDIO=none`). Verified with frame dumps: CRIWARE logo → Dragon's Crown Pro logo → class intro
-  (Elf, Sorceress, ...) → title screen (`©ATLUS ©SEGA`) → attract loop. `Font: system font set`,
-  `SAVEDATA00` created/written, 300 s runs without a crash, ~20 fps in Ryujinx.
-- **What fixed it** (details in §1.1):
-  1. The Box64 dynarec had never run a single block: Box64 only compiles memory its memprot map knows
-     as R+X, and nothing registered the loader's image. Everything was interpreted (the earlier
-     "dynarec on" claims were wrong), so the CRILAYLA decompressor ran at ~24 KB/s and the boot task
-     looked stalled at `pending=4`. Fixed in `nx_x64_mark_code` (`src/nx/box64_os_nx.c`), called for
-     every executable segment from `src/loader.c`.
-  2. Guest pool 2304+256 MiB left Mesa too little memory: `GL_OUT_OF_MEMORY`, then a crash in
-     `glFramebufferTexture2D` (Mesa 20.1 NULL deref on a texture without storage) and later a C++
-     throw. Defaults are now 2176 MiB direct + 32 MiB flexible (game uses 2089 / 0.25 MiB);
-     attachments are guarded (`Rasterizer::AttachImage`).
+- **Works (Ryujinx Canary 1.3.354):** paths, `DCPBOOT1`, 2176+32 MiB guest pool, 800 MiB large-block
+  arena, Box64 dynarec (`BOX64_DYNAREC_STRONGMEM=1` default) and interpreter, GL 4.3 core on Mesa
+  nouveau, direct `libnx audout` stereo audio, 3 module initializers, guest entry, 4 pads, split CPK
+  (`DRACRO.CPK.000/.001`), runtime log (`logs/dragons_crown_pro_NNN.log`) and `logs/bringup.log`.
+- **2026-11-22 late evening: character rendering, OOM, audio, and Phase 5 gates all passing.**
+  - **Invisible character & recurring `GL_OUT_OF_MEMORY` (0x505) solved:** both were the same bug.
+    `GL_DEBUG=1` + `DRAW_TRACE` + `--wrap=nouveau_bo_new` showed `nouveau_bo_new` failing with
+    `ENOMEM` (`memalign` NULL, `unmap=5 MiB`, `fordblks=364 MiB`) on `16 MiB` (`4096×4096` BC7)
+    sprite/UI/background atlases while smaller textures (`<= 2048×2048`, weapons/shields/staffs)
+    still fit. Newlib `dlmalloc` on Horizon has `HAVE_MMAP=0`, so 540+ per-frame `8100 KiB`
+    (`1920×1080×4`) Mesa staging BOs interleaved with small allocations and shredded 364 MiB of free
+    heap into `< 8 MiB` holes.
+    - Fixed with [src/nx/nx_large_arena.c](src/nx/nx_large_arena.c): dedicated `800 MiB` page-aligned
+      best-fit coalescing arena for `512 KiB .. 128 MiB` allocations (`--wrap` of newlib's
+      `_malloc_r`/`_calloc_r`/`_memalign_r`/`_realloc_r`/`_free_r`/`_malloc_usable_size_r`),
+      isolating large GPU BOs from `dlmalloc`.
+    - Tightened Switch `TextureCache` eviction (`UnusedFramesBeforeEviction = 300`, sweep every 64
+      frames) plus emergency `Sweep(2)` + `glFinish` retry on `GL_OUT_OF_MEMORY`.
+    - Verified through Create Character (`frame_02400.bmp`), Select Player (`frame_02640.bmp`),
+      Rannie's Inn cutscene (`frame_02880..03120.bmp`), and into the Tutorial stage (`tutorial-verify`,
+      3900 frames / 1.3M draws, `frame_03360..03840.bmp`): armored Fighter renders in full detail
+      with lighting/HUD/checklist, `glErr=0x0(0)`, zero `NOUVEAU_BO_FAIL`, `heap_free=372–436 MiB`,
+      `arena=568–614/800 MiB` (`big=65–125 MiB` contiguous free).
+  - **Switch audio bug found & fixed:** devkitPro SDL2's `SWITCHAUDIO_PlayDevice` spins forever in
+    `while (wavebuf.state != Playing)` if a >21 ms load hitch lets a wavebuf jump straight to `Done`,
+    deadlocking audio and leaking `SDL_QueueAudio` at ~11 MiB/min. Replaced with a direct 6-slot
+    `4096 B` `libnx audout` ring in `src/runtime_audio.c`: steady `938/937 buffers/5s`, `~42 ms`
+    latency (`min queued 4–8 KiB`), zero starvation after boot, survives 390 ms load hitches.
+  - **Phase 5 gates passed:** `BOX64_DYNAREC_STRONGMEM=1` (now default in `src/nx/box64_os_nx.c`,
+    zero measured speed penalty), split CPK (`DRACRO.CPK.000/.001`), `SoftwarePageTable` run
+    (`runs/20261122-222015-softpt-gate`, 1260 frames, `glErr=0x0(0)`), RAM margin (~390 MiB free).
+  - **Early exit at ~200 s explained:** `padexplore` accidentally opened the `SoftwareKeyboard`
+    applet ("Dying message") at 2:40; Ryujinx Canary 1.3.354 ran 330 s cleanly with no exit.
+  - **Phase 7 cleanup:** removed `R#17..60` read logs from `src/runtime_file.c` and the hardcoded
+    `fs_mgr`/PEND probes from `gl_presenter.cpp`.
+- **Earlier fixes** (details in §1.1):
+  1. Box64 dynarec memprot registration via `nx_x64_mark_code` (`src/nx/box64_os_nx.c` / `src/loader.c`).
+  2. Guest pool sized to 2176 MiB direct + 32 MiB flexible; render-target attachments guarded
+     (`Rasterizer::AttachImage`).
 
-### 0.1 Open issues (next work, Ryujinx)
-1. **Input on the title screen is untested** (press A/Start in Ryujinx → new game → first stage).
-2. **`GL_OUT_OF_MEMORY` (0x505) still recurs** every few seconds after ~frame 700 although the heap has
-   300–500 MiB free → one specific GL allocation fails (large or fragmented). Add a KHR_debug callback
-   (`glDebugMessageCallback`, GL 4.3 core) to name the call.
-3. **Intermittent freeze**: 1 of ~8 runs stopped presenting at frame 139 (~17 s, `pending=43`) with no
-   Ryujinx error. Reproduce with `STALL_DUMP=1` and read the dump.
-4. **Any C++ throw crashes in Ryujinx**: libgcc's unwinder runs `mov x16,#1; chkfeat x16; cbnz x16`
-   before `mrs gcspr_el0`; Ryujinx 1.3.3 leaves x16=0 and then aborts on the unknown MRS. On the
-   Switch's Cortex-A57 `chkfeat` is an architectural NOP, so hardware skips the MRS. If throws become
-   common, patch the 5 `chkfeat` (0xd503251f) in libgcc's unwinder to `nop` after linking.
-5. Phase 5 gate below (SoftwarePageTable run, `DYNAREC_STRONGMEM`, RAM margin) before hardware.
+### 0.1 Remaining items (before / on Switch hardware)
+1. **30-min soak** in Ryujinx (or manual play into first real dungeon stage + boss) to confirm long-run
+   arena stability and zero intermittent 17 s stall (not reproduced across 8 consecutive Canary 1.3.354
+   runs).
+2. **Real Switch hardware boot** (Title Takeover, hold R on a game): deploy with
+   `tools/prepare_nx.ps1 -SplitCpk`, verify visual output, `libnx audout` audio, FPS, and
+   `heap_free`/`arena` in `logs/bringup.log`.
+3. **Pad mapping (hardware check):** confirm whether Switch physical B arrives as Cross (positional)
+   or A (label); adjust `PAD_MAP=cross=b,circle=a` in `nx.ini` if inverted, then make it default.
+4. **C++ throw in Ryujinx (known Ryujinx quirk, non-hardware):** libgcc's unwinder executes 5
+   `chkfeat x16` (`0xd503251f`) before `mrs gcspr_el0`; Cortex-A57 hardware treats `chkfeat` as NOP.
+   Only needed if a Ryujinx test hits a C++ throw.
+5. **`NX_SAFE=0` features** (later): guest-hook features need >4-arg/XMM host→guest marshalling (§7).
+
+### 0.2 Diagnostics kept behind `nx.ini` knobs
+- `GL_DEBUG=1`: KHR_debug synchronous callback (`GL_DBG` in `bringup.log`).
+- `DRAW_TRACE=N`: dumps every draw of presented frame `N` to `logs/draw_trace.txt`, unique linked
+  GLSL shaders to `logs/draw_shaders.txt`, and `logs/frame_NNNNN.bmp`.
+- `FRAME_DUMP=N`, `STALL_DUMP=1`, `AUDIO_STATS=1`, `NX_LARGE_ARENA_MB=N`, `PAD_FILE=...`.
+- Always-on zero-cost failure logs: `GL_ALLOC_ERR` (texture allocation error) and `NOUVEAU_BO_FAIL`
+  (`--wrap=nouveau_bo_new`, logs only when `rc != 0`).
 
 ## 1. Stall analysis (historical, solved)
 
@@ -103,6 +133,12 @@ Game-side detail (from static analysis of `boot.bin`, kept for reference):
 - `powershell -ExecutionPolicy Bypass -File tools\ryu_run.ps1 -Label x -Seconds 240 -StopMarker NEVER
   -Ini 'KEY=V,KEY2=V2'` → build, deploy, run, logs + frame dumps in `runs\<ts>-<label>\`, summary line.
   `-NoBuild` skips the build; the default stop marker is `Font: system font set`.
+  `-Pad "55:options,70:options,85:cross"` presses pad-1 buttons at seconds after launch (PS4 names:
+  cross, circle, square, triangle, l1, r1, l2, r2, l3, r3, options, touchpad).
+- Launching Ryujinx by hand also works, but logs stay in the SD `logs/` folder and `bringup.log`
+  keeps growing; `nx.ini` keeps whatever the last `ryu_run` wrote.
+- Timing reference (default build, no input): entry ~11 s, CRIWARE ~25 s, game logo ~49 s, title
+  ~119 s after process start.
 
 ### Phase 2 — Platform instrumentation (done; nx.ini knobs)
 - `STALL_DUMP=1`: every 5 s, dynarec block/interpreter counts plus per-thread current HLE call, args,
@@ -118,24 +154,25 @@ Game-side detail (from static analysis of `boot.bin`, kept for reference):
 - Scheduler spread: no change. Dynarec counters → root cause (§1.1).
 
 ### Phase 4 — Ryujinx milestones
-- Done: `pending=0`, `Font: system font set`, `SAVEDATA00` write, logos/title (`max>0`).
-- Next: open issues §0.1 → input on title → new game → first playable area → 30-min soak.
+- Done: `pending=0`, `Font: system font set`, `SAVEDATA00` write, logos/title (`max>0`), input on
+  title, menus, character creation, tutorial stage loads.
+- Next: §0.1 (invisible character first) → first real stage → 30-min soak.
 - `NX_SAFE=0` features one by one later (needs >4-arg/XMM host→guest marshalling, §7).
 
-### Phase 5 — Ryujinx gate before hardware
-- One run with `MemoryManagerMode` SoftwarePageTable (or safe HostMapped).
-- Ryujinx runs ARM on x86 (TSO), hiding ordering bugs: default `DYNAREC_STRONGMEM=1` for the first
-  hardware boot.
-- Pool + Box64 caches + GL budgets fit title-takeover RAM (~3.2 GB) with margin.
-- One Ryujinx run with split CPK parts (as on FAT32).
+### Phase 5 — Ryujinx gate before hardware (done except 30-min soak)
+- Done: `MemoryManagerMode` SoftwarePageTable (`softpt-gate`, 1260 frames, `glErr=0x0`),
+  `BOX64_DYNAREC_STRONGMEM=1` defaulted on, RAM margin (`heap_free=372–436 MiB`,
+  `arena=568–614/800 MiB`), split CPK (`DRACRO.CPK.000/.001`), direct `libnx audout` stereo audio.
+- Remaining: 30-min soak (or manual play into first real dungeon stage).
 
 ### Phase 6 — Hardware
 - `tools/prepare_nx.ps1 -SplitCpk` to SD, same `nx.ini` as the passing Ryujinx run, Title Takeover
   (hold R on a game), logs via FTP (`ftp://192.168.8.221:5000/switch/dragons_crown_pro/`).
 
-### Phase 7 — Cleanup
-- Remove game-struct probes from `gl_presenter.cpp`; keep census/watchdog/ledger behind knobs; keep
-  `g_trace_lock` in `nx_platform.c`.
+### Phase 7 — Cleanup (done)
+- Removed `R#17..60` read logs from `src/runtime_file.c` and `fs_mgr`/PEND probes from
+  `gl_presenter.cpp`; kept `GL_DEBUG`, `DRAW_TRACE`, `FRAME_DUMP`, `STALL_DUMP`, `AUDIO_STATS` behind
+  `nx.ini` knobs and `g_trace_lock` in `nx_platform.c`.
 
 ## 3. Architecture summary
 

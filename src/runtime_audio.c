@@ -14,6 +14,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
+#ifdef __SWITCH__
+#include <malloc.h>
+#include <switch.h>
+#endif
 
 #define PORTS 25
 #define ERR_NOT_OPENED ((int32_t)0x80260001)
@@ -50,6 +54,74 @@ static Port ports[PORTS];
 static int initialized, sdl_ready=-1;
 static size_t buffers_out, ports_opened;
 
+#ifdef __SWITCH__
+/* Direct libnx audout ring: devkitPro SDL2's audren driver spins forever in
+ * SWITCHAUDIO_PlayDevice if a 21 ms wavebuf reaches Done before it polls for Playing. */
+#define NX_AUDOUT_SLOTS 6
+#define NX_AUDOUT_BYTES 4096
+static AudioOutBuffer nx_abufs[NX_AUDOUT_SLOTS];
+static uint8_t nx_abusy[NX_AUDOUT_SLOTS];
+static uint8_t nx_astage[NX_AUDOUT_BYTES];
+static size_t nx_astage_len;
+static int nx_ainflight, nx_aowner = -1, nx_ainited;
+
+static void nx_audout_mark_released(AudioOutBuffer *rel, u32 cnt) {
+    if (!rel || !cnt) return;
+    for (int i = 0; i < NX_AUDOUT_SLOTS; ++i) {
+        if (&nx_abufs[i] == rel && nx_abusy[i]) {
+            nx_abusy[i] = 0;
+            if (nx_ainflight > 0) --nx_ainflight;
+            break;
+        }
+    }
+}
+static void nx_audout_drain(void) {
+    AudioOutBuffer *rel = NULL;
+    u32 cnt = 0;
+    while (R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&rel, &cnt)) && cnt > 0 && rel) {
+        nx_audout_mark_released(rel, cnt);
+        rel = NULL;
+        cnt = 0;
+    }
+}
+static int nx_audout_queued(void) {
+    nx_audout_drain();
+    return nx_ainflight * NX_AUDOUT_BYTES + (int)nx_astage_len;
+}
+static void nx_audout_push(const uint8_t *data, size_t len) {
+    while (len > 0) {
+        size_t take = NX_AUDOUT_BYTES - nx_astage_len;
+        if (take > len) take = len;
+        memcpy(nx_astage + nx_astage_len, data, take);
+        nx_astage_len += take;
+        data += take;
+        len -= take;
+        if (nx_astage_len < NX_AUDOUT_BYTES) break;
+        nx_astage_len = 0;
+        nx_audout_drain();
+        if (nx_ainflight >= NX_AUDOUT_SLOTS) {
+            AudioOutBuffer *rel = NULL;
+            u32 cnt = 0;
+            if (R_SUCCEEDED(audoutWaitPlayFinish(&rel, &cnt, 50000000ULL))) {
+                nx_audout_mark_released(rel, cnt);
+                nx_audout_drain();
+            }
+        }
+        int slot = -1;
+        for (int i = 0; i < NX_AUDOUT_SLOTS; ++i) {
+            if (!nx_abusy[i]) { slot = i; break; }
+        }
+        if (slot < 0) continue; /* device stalled: drop cleanly instead of leaking */
+        memcpy(nx_abufs[slot].buffer, nx_astage, NX_AUDOUT_BYTES);
+        nx_abufs[slot].data_size = NX_AUDOUT_BYTES;
+        if (R_SUCCEEDED(audoutAppendAudioOutBuffer(&nx_abufs[slot]))) {
+            nx_abusy[slot] = 1;
+            ++nx_ainflight;
+        }
+    }
+}
+#endif
+
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
 static void sleep_until(uint64_t deadline) {
 #ifdef _WIN32
@@ -70,8 +142,33 @@ static void sleep_until(uint64_t deadline) {
 static int sdl_audio(void) {
     if (sdl_ready<0) {
         const char *mode=getenv("DCP_AUDIO");
+#ifdef __SWITCH__
+        if (!mode || strcmp(mode,"none")) {
+            Result rc = audoutInitialize();
+            if (R_SUCCEEDED(rc)) rc = audoutStartAudioOut();
+            if (R_SUCCEEDED(rc)) {
+                nx_ainited = 1;
+                for (int i = 0; i < NX_AUDOUT_SLOTS; ++i) {
+                    nx_abufs[i].next = NULL;
+                    nx_abufs[i].buffer = memalign(0x1000, NX_AUDOUT_BYTES);
+                    nx_abufs[i].buffer_size = NX_AUDOUT_BYTES;
+                    nx_abufs[i].data_size = NX_AUDOUT_BYTES;
+                    nx_abufs[i].data_offset = 0;
+                    nx_abusy[i] = 0;
+                }
+                sdl_ready = 1;
+            } else {
+                fprintf(stderr, "Runtime: libnx audout init failed (0x%x); using timer sink\n", (unsigned)rc);
+                sdl_ready = 0;
+            }
+        } else {
+            sdl_ready = 0;
+        }
+        printf("Runtime: audio backend %s\n", sdl_ready ? "libnx audout (48kHz stereo S16)" : "timer (silent)");
+#else
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
         printf("Runtime: audio backend %s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)");
+#endif
     }
     return sdl_ready;
 }
@@ -145,17 +242,10 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     if (sdl_audio()) {
 #ifdef __SWITCH__
         p->downmix = (p->channels == 8);
-        SDL_AudioSpec want = {0};
-        want.freq = 48000;
-        want.format = AUDIO_S16LSB;
-        want.channels = (Uint8)(p->downmix ? 2 : p->channels);
-        want.samples = 1024;
-        SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
-        if (dev) {
-            SDL_PauseAudioDevice(dev, 0);
-            p->stream = (SDL_AudioStream *)(uintptr_t)dev;
-        } else {
-            fprintf(stderr,"Runtime: SDL2 audio open failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+        if (nx_aowner < 0) {
+            nx_aowner = id;
+            nx_astage_len = 0;
+            p->stream = (SDL_AudioStream *)(uintptr_t)1;
         }
 #else
         SDL_AudioSpec device; int device_frames;
@@ -187,7 +277,11 @@ static ABI int32_t audio_close(int32_t handle) {
     if (p) {
         pthread_mutex_lock(&p->lock);
 #ifdef __SWITCH__
-        if (p->stream) SDL_CloseAudioDevice((SDL_AudioDeviceID)(uintptr_t)p->stream);
+        if (p->stream && nx_aowner == (int)(p - ports)) {
+            nx_audout_drain();
+            nx_aowner = -1;
+            nx_astage_len = 0;
+        }
 #else
         if (p->stream) SDL_DestroyAudioStream(p->stream);
 #endif
@@ -234,6 +328,16 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             }
             bytes = n * 2;
         }
+        if (p->channels == 1) {
+            size_t n = bytes / 2;
+            int16_t *dst = (int16_t *)converted;
+            for (size_t i = n; i > 0; --i) {
+                int16_t s = dst[i - 1];
+                dst[(i - 1) * 2] = s;
+                dst[(i - 1) * 2 + 1] = s;
+            }
+            bytes = n * 4;
+        }
 #endif
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {
@@ -242,7 +346,11 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             else if (now-p->stat_last_ns>p->stat_max_gap_ns) p->stat_max_gap_ns=now-p->stat_last_ns;
             p->stat_last_ns=now; ++p->stat_buffers;
             if (p->stream) {
+#ifdef __SWITCH__
+                int queued = nx_audout_queued();
+#else
                 int queued=SDL_GetAudioStreamQueued(p->stream);
+#endif
                 if (queued<p->stat_min_queued) p->stat_min_queued=queued;
                 if (queued==0) ++p->stat_starved;
             }
@@ -260,6 +368,9 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             p->next_deadline_ns+=period;
         }
         if (p->stream) {
+#ifdef __SWITCH__
+            nx_audout_push(converted, bytes);
+#else
             /* The device drains the queue in quanta (21 ms on PipeWire), so the level
                is a sawtooth: its minimum over ~32 buffers is what gets controlled. */
             int low=2*(int)bytes, queued=SDL_GetAudioStreamQueued(p->stream);
@@ -275,6 +386,7 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             }
             p->next_deadline_ns+=(uint64_t)p->adjust_ns;
             SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
+#endif
         }
         ++buffers_out;
     }
