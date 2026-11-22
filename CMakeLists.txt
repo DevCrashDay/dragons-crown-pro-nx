@@ -185,6 +185,7 @@ elseif (DCP_SWITCH)
         src/runtime_log_posix.c
         src/runtime_session_log.c
         src/nx/nx_platform.c
+        src/nx/nx_large_arena.c
         src/nx/nx_gpu_probe.c
         src/nx/nx_x64_selftest.c
         src/nx/nx_posix_stubs.c
@@ -246,7 +247,10 @@ elseif (DCP_SWITCH)
     target_include_directories(dragons_crown_pro PRIVATE src/nx src/nx/sdl3_shim src/nx/compat_headers third_party/trg-launcher/include)
     target_compile_options(dragons_crown_pro PRIVATE -Wno-attributes -Wno-enum-compare -Wno-unused-but-set-variable -Wno-unused-function -Wno-format-truncation)
     target_link_directories(dragons_crown_pro PRIVATE "$ENV{DEVKITPRO}/libnx/lib" "$ENV{DEVKITPRO}/portlibs/switch/lib")
-    target_link_options(dragons_crown_pro PRIVATE "-specs=$ENV{DEVKITPRO}/libnx/switch.specs")
+    target_link_options(dragons_crown_pro PRIVATE "-specs=$ENV{DEVKITPRO}/libnx/switch.specs"
+        "-Wl,--wrap=nouveau_bo_new"
+        "-Wl,--wrap=_malloc_r" "-Wl,--wrap=_calloc_r" "-Wl,--wrap=_memalign_r"
+        "-Wl,--wrap=_realloc_r" "-Wl,--wrap=_free_r" "-Wl,--wrap=_malloc_usable_size_r")
     target_link_libraries(dragons_crown_pro PRIVATE dcpgpu box64nx PkgConfig::SDL2 PkgConfig::FREETYPE m)
     if (NOT COMMAND nx_generate_nacp)
         include("$ENV{DEVKITPRO}/cmake/Switch.cmake")

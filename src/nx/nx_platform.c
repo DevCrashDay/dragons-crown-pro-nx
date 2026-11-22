@@ -160,6 +160,7 @@ void nx_platform_init(void) {
     appletLockExit();
     atexit(nx_platform_exit);
     load_ini();
+    nx_large_arena_init();
     if (nx_platform_is_applet_mode())
         nx_platform_trace("Switch: APPLET MODE: limited memory; launch in Title Takeover\n");
     nx_platform_trace("Switch: init done\n");
@@ -211,7 +212,7 @@ void nx_platform_heap_info(uint64_t *heap_total, uint64_t *heap_free) {
                             ? (uint64_t)(uintptr_t)(fake_heap_end - cur_brk)
                             : 0;
     struct mallinfo mi = mallinfo();
-    uint64_t free_bytes = unmapped + (uint64_t)(uint32_t)mi.fordblks;
+    uint64_t free_bytes = unmapped + (uint64_t)(uint32_t)mi.fordblks + nx_large_arena_free_bytes();
     if (heap_total) *heap_total = total;
     if (heap_free) *heap_free = free_bytes;
 #else
@@ -219,6 +220,37 @@ void nx_platform_heap_info(uint64_t *heap_total, uint64_t *heap_free) {
     if (heap_free) *heap_free = 0;
 #endif
 }
+
+#ifdef __SWITCH__
+int __real_nouveau_bo_new(void *dev, uint32_t flags, uint32_t align, uint64_t size, void *cfg, void **pbo);
+int __wrap_nouveau_bo_new(void *dev, uint32_t flags, uint32_t align, uint64_t size, void *cfg, void **pbo) {
+    static uint64_t total_ok = 0, calls_ok = 0, fails = 0;
+    int rc = __real_nouveau_bo_new(dev, flags, align, size, cfg, pbo);
+    if (rc == 0) {
+        total_ok += size;
+        ++calls_ok;
+    } else if (++fails <= 24) {
+        extern char *fake_heap_end;
+        char *cur_brk = (char *)sbrk(0);
+        uint64_t unmapped = (cur_brk && fake_heap_end > cur_brk)
+                                ? (uint64_t)(uintptr_t)(fake_heap_end - cur_brk)
+                                : 0;
+        struct mallinfo mi = mallinfo();
+        uint64_t au = 0, af = 0, abig = 0;
+        int ana = 0, anf = 0;
+        nx_large_arena_stats(&au, &af, &abig, &ana, &anf);
+        nx_platform_trace("NOUVEAU_BO_FAIL[#%llu]: rc=%d(0x%x) sz=%lluKiB al=0x%x fl=0x%x ok=%llu(%lluMiB) unmap=%lluMiB ford=%uMiB arena=%llu/%lluMiB(big=%lluMiB n=%d/%d)\n",
+                          (unsigned long long)fails, rc, (unsigned)(-rc),
+                          (unsigned long long)(size >> 10), align, flags,
+                          (unsigned long long)calls_ok, (unsigned long long)(total_ok >> 20),
+                          (unsigned long long)(unmapped >> 20),
+                          (unsigned)((uint32_t)mi.fordblks >> 20),
+                          (unsigned long long)(au >> 20), (unsigned long long)((au + af) >> 20),
+                          (unsigned long long)(abig >> 20), ana, anf);
+    }
+    return rc;
+}
+#endif
 
 int nx_platform_has_nxlink(void) {
     return g_nxlink_sock >= 0;

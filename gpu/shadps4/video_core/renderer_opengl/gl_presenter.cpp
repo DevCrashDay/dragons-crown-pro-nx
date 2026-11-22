@@ -31,9 +31,8 @@ extern "C" void runtime_log_flush(void);
 #include <unistd.h>
 extern "C" void nx_platform_trace(const char* format, ...);
 extern "C" void runtime_file_stats(uint64_t* out_reads, uint64_t* out_bytes);
-extern "C" int g_nx_trace_loop;
-extern "C" uint64_t g_nx_image_base;
 extern "C" void nx_platform_heap_info(uint64_t* heap_total, uint64_t* heap_free);
+extern "C" void nx_large_arena_stats(uint64_t* used_bytes, uint64_t* free_bytes, uint64_t* largest_free, int* nalloc, int* nfree);
 #endif
 
 namespace OpenGL {
@@ -285,6 +284,26 @@ void Presenter::InitializeOnGpuThread() {
     if (const auto missing = MissingRequirement(capabilities); !missing.empty()) {
         Fatal(missing);
     }
+#ifdef __SWITCH__
+    if (const char* gl_dbg = std::getenv("DCP_GL_DEBUG"); gl_dbg && gl_dbg[0] == '1' && gl::DebugMessageCallback) {
+        constexpr GLenum kDebugOutput = 0x92E0;
+        constexpr GLenum kDebugOutputSync = 0x8242;
+        constexpr GLenum kSeverityNotification = 0x826B;
+        gl::Enable(kDebugOutput);
+        gl::Enable(kDebugOutputSync);
+        gl::DebugMessageCallback(
+            [](GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei, const GLchar* msg, const void*) {
+                if (severity == kSeverityNotification) return;
+                static u32 count = 0;
+                if (++count <= 64) {
+                    nx_platform_trace("GL_DBG[#%u src=0x%x type=0x%x id=0x%x sev=0x%x]: %s\n",
+                                      count, source, type, id, severity, msg ? msg : "");
+                }
+            },
+            nullptr);
+        nx_platform_trace("OpenGL: KHR_debug callback enabled (sync)\n");
+    }
+#endif
     rasterizer = std::make_unique<Rasterizer>(liverpool, capabilities);
     CreatePasses();
     DcpOverlay::InitOpenGL();
@@ -460,7 +479,15 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
         DcpOverlay::LogPresent();
     }
 #ifdef __SWITCH__
-    if (shown_count == 1 || (shown_count % 60) == 0 || first_game) {
+    static const u32 trace_frame = [] {
+        const char* e = std::getenv("DCP_DRAW_TRACE");
+        return e ? u32(std::atoi(e)) : 0u;
+    }();
+    const bool traced_now = trace_frame > 0 && shown_count == trace_frame;
+    if (traced_now) {
+        rasterizer->EndDrawTrace("sdmc:/switch/dragons_crown_pro/logs/draw_shaders.txt");
+    }
+    if (shown_count == 1 || (shown_count % 60) == 0 || first_game || traced_now) {
         using ReadPixelsFn = void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
         static auto read_px = reinterpret_cast<ReadPixelsFn>(SDL_GL_GetProcAddress("glReadPixels"));
         u8 max_rgb = 0;
@@ -483,7 +510,7 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
             const char* e = std::getenv("DCP_FRAME_DUMP");
             return e ? std::atoi(e) : 0;
         }();
-        if (read_px && dump_every > 0 && shown_count % unsigned(dump_every) == 0) {
+        if (read_px && (traced_now || (dump_every > 0 && shown_count % unsigned(dump_every) == 0))) {
             const int w = window_width / 4, h = window_height / 4, row = (w * 3 + 3) & ~3;
             // One source row per output row: a whole-frame read needs a large staging copy.
             std::vector<u8> line(size_t(window_width) * 4);
@@ -509,60 +536,33 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
                 std::fclose(f);
             }
         }
-        const GLenum err = gl::GetError();
+        GLenum err = 0;
+        u32 err_cnt = 0;
+        while (GLenum e = gl::GetError()) {
+            if (!err) err = e;
+            if (++err_cnt >= 64) break;
+        }
         uint64_t f_reads = 0, f_bytes = 0;
         runtime_file_stats(&f_reads, &f_bytes);
-        int32_t pending_loads = -1;
-        if (g_nx_image_base) {
-            uint64_t app = *reinterpret_cast<const volatile uint64_t*>(g_nx_image_base + 0xe78708);
-            if (app) {
-                uint64_t fs_mgr = *reinterpret_cast<const volatile uint64_t*>(app + 0x48);
-                if (fs_mgr) pending_loads = *reinterpret_cast<const volatile int32_t*>(fs_mgr + 0x78);
-            }
-        }
         uint64_t heap_total = 0, heap_free = 0;
         nx_platform_heap_info(&heap_total, &heap_free);
-        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) pending=%d center=(%u,%u,%u) max=%u glErr=0x%x heap_free=%lluMiB\n",
+        uint64_t au = 0, af = 0, abig = 0;
+        int ana = 0, anf = 0;
+        nx_large_arena_stats(&au, &af, &abig, &ana, &anf);
+        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) center=(%u,%u,%u) max=%u glErr=0x%x(%u) heap_free=%lluMiB arena=%llu/%lluMiB(big=%lluMiB)\n",
                           shown_count, window_width, window_height,
                           static_cast<unsigned long long>(rasterizer->DrawsReachingGl()),
                           static_cast<unsigned long long>(rasterizer->Draws()),
                           static_cast<unsigned long long>(f_reads),
                           static_cast<unsigned long long>(f_bytes / 1024),
-                          pending_loads,
-                          px[0], px[1], px[2], max_rgb, err, static_cast<unsigned long long>(heap_free >> 20));
-        static bool dumped_p4 = false;
-        if ((shown_count == 240 || (!dumped_p4 && pending_loads == 4)) && g_nx_image_base) {
-            if (pending_loads == 4) dumped_p4 = true;
-            uint64_t app = *reinterpret_cast<const volatile uint64_t*>(g_nx_image_base + 0xe78708);
-            uint64_t fs_mgr = app ? *reinterpret_cast<const volatile uint64_t*>(app + 0x48) : 0;
-            if (fs_mgr) {
-                for (int b = 0; b < 256; ++b) {
-                    uint64_t node = *reinterpret_cast<const volatile uint64_t*>(fs_mgr + 0x90 + b * 32);
-                    while (node) {
-                        uint64_t ent = *reinterpret_cast<const volatile uint64_t*>(node + 0x20);
-                        if (ent) {
-                            int32_t st = *reinterpret_cast<const volatile int32_t*>(ent + 0x54);
-                            uint32_t f50 = *reinterpret_cast<const volatile uint32_t*>(ent + 0x50);
-                            uint8_t b5b = *reinterpret_cast<const volatile uint8_t*>(ent + 0x5b);
-                            uint8_t b5c = *reinterpret_cast<const volatile uint8_t*>(ent + 0x5c);
-                            int32_t ref = *reinterpret_cast<const volatile int32_t*>(ent + 0x98);
-                            if (st != 2 && b5b != 0) {
-                                uint64_t cap = *reinterpret_cast<const volatile uint64_t*>(ent + 0xf0);
-                                const char* nm = (cap >= 16)
-                                    ? *reinterpret_cast<const char* const*>(ent + 0xd8)
-                                    : reinterpret_cast<const char*>(ent + 0xd8);
-                                uint64_t cri = *reinterpret_cast<const volatile uint64_t*>(ent + 0x90);
-                                int cri_st = cri ? *reinterpret_cast<const volatile uint8_t*>(cri + 0x5b) : -1;
-                                const char* cri_path = cri ? reinterpret_cast<const char*>(cri + 0x8c) : "?";
-                                nx_platform_trace("  PEND(#%u p=%d): f50=0x%x b5b=%u b5c=%u ref=%d cri_st=%d path=%s name=%s\n",
-                                                  shown_count, pending_loads, f50, b5b, b5c, ref, cri_st, cri_path, nm ? nm : "?");
-                            }
-                        }
-                        node = *reinterpret_cast<const volatile uint64_t*>(node + 0x10);
-                    }
-                }
-            }
-        }
+                          px[0], px[1], px[2], max_rgb, err, err_cnt,
+                          static_cast<unsigned long long>(heap_free >> 20),
+                          static_cast<unsigned long long>(au >> 20),
+                          static_cast<unsigned long long>((au + af) >> 20),
+                          static_cast<unsigned long long>(abig >> 20));
+    }
+    if (trace_frame > 0 && shown_count + 1 == trace_frame) {
+        rasterizer->BeginDrawTrace("sdmc:/switch/dragons_crown_pro/logs/draw_trace.txt", trace_frame);
     }
 #endif
     const bool swapped = SDL_GL_SwapWindow(window.GetSDLWindow());

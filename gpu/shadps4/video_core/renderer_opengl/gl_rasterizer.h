@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <cstdio>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -100,6 +102,8 @@ public:
     /// Plain state for the presenter's own passes.
     void ResetState();
     void OnFlip();
+    void BeginDrawTrace(const char* path, u32 frame_num);
+    void EndDrawTrace(const char* shaders_path);
 
 private:
     /// As far as the guest's index buffer is mapped.
@@ -197,6 +201,24 @@ private:
     std::unordered_set<const char*> reported_literals;
     u64 draws{};
     u64 draws_reaching_gl{};
+    std::FILE* trace_file{};
+    u32 trace_draw_idx{};
+    struct TraceTexEntry {
+        char stage;
+        u32 unit;
+        VAddr addr;
+        u32 w, h;
+        GLenum target;
+        GLuint handle;
+        GLint gl_w;
+        bool gpu_written;
+        u32 fmt;
+        u32 num_fmt;
+        u8 base_mip, last_mip;
+    };
+    std::vector<TraceTexEntry> trace_textures;
+    char trace_bind_stage{'?'};
+    std::map<std::tuple<StageModule*, StageModule*, Shader::Backend::GLSL::PrimitiveExpansion>, u32> trace_programs;
 };
 
 } // namespace OpenGL

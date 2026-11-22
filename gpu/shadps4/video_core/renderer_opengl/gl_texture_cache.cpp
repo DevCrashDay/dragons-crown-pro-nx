@@ -14,10 +14,18 @@
 #include "video_core/renderer_opengl/gl_state.h"
 #include "video_core/renderer_opengl/gl_texture_cache.h"
 
+#ifdef __SWITCH__
+extern "C" void nx_platform_trace(const char* format, ...);
+#endif
+
 namespace OpenGL {
 namespace {
 
+#ifdef __SWITCH__
+constexpr u64 UnusedFramesBeforeEviction = 300;
+#else
 constexpr u64 UnusedFramesBeforeEviction = 1800;
+#endif
 constexpr u32 TileRows = 8;
 
 enum class ResolvedKind : u64 { Texture = 1, Color = 2, Depth = 3 };
@@ -78,44 +86,79 @@ void TextureCache::Allocate(Image& image) {
         gl::TexParameteri(image.target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
     const u32 layers = image.target == GL_TEXTURE_3D ? info.size.depth : info.resources.layers;
-    for (u32 level = 0; level < levels; ++level) {
-        const GLsizei width = GLsizei(std::max(info.size.width >> level, 1u));
-        const GLsizei height = GLsizei(std::max(info.size.height >> level, 1u));
-        const GLsizei depth = image.target == GL_TEXTURE_3D
-                                  ? GLsizei(std::max(info.size.depth >> level, 1u))
-                                  : GLsizei(layers);
-        if (format->compressed) {
-            const GLsizei blocks = ((width + 3) / 4) * ((height + 3) / 4);
-            const GLsizei bytes = blocks * GLsizei(info.num_bits / 8);
-            if (image.target == GL_TEXTURE_2D) {
-                gl::CompressedTexImage2D(GL_TEXTURE_2D, GLint(level), format->internal_format,
-                                         width, height, 0, bytes, nullptr);
-            } else {
-                gl::CompressedTexImage3D(image.target, GLint(level), format->internal_format, width,
-                                         height, depth, 0, bytes * depth, nullptr);
+    auto alloc_levels = [&] {
+        state.BindForEdit(image.target, image.handle);
+        for (u32 level = 0; level < levels; ++level) {
+            const GLsizei width = GLsizei(std::max(info.size.width >> level, 1u));
+            const GLsizei height = GLsizei(std::max(info.size.height >> level, 1u));
+            const GLsizei depth = image.target == GL_TEXTURE_3D
+                                      ? GLsizei(std::max(info.size.depth >> level, 1u))
+                                      : GLsizei(layers);
+            if (format->compressed) {
+                const GLsizei blocks = ((width + 3) / 4) * ((height + 3) / 4);
+                const GLsizei bytes = blocks * GLsizei(info.num_bits / 8);
+                if (image.target == GL_TEXTURE_2D) {
+                    gl::CompressedTexImage2D(GL_TEXTURE_2D, GLint(level), format->internal_format,
+                                             width, height, 0, bytes, nullptr);
+                } else {
+                    gl::CompressedTexImage3D(image.target, GLint(level), format->internal_format, width,
+                                             height, depth, 0, bytes * depth, nullptr);
+                }
+                continue;
             }
-            continue;
+            const GLint internal = GLint(format->internal_format);
+            switch (image.target) {
+            case GL_TEXTURE_1D:
+                gl::TexImage1D(GL_TEXTURE_1D, GLint(level), internal, width, 0, format->format,
+                               format->type, nullptr);
+                break;
+            case GL_TEXTURE_1D_ARRAY:
+                gl::TexImage2D(GL_TEXTURE_1D_ARRAY, GLint(level), internal, width, depth, 0,
+                               format->format, format->type, nullptr);
+                break;
+            case GL_TEXTURE_2D:
+                gl::TexImage2D(GL_TEXTURE_2D, GLint(level), internal, width, height, 0, format->format,
+                               format->type, nullptr);
+                break;
+            default:
+                gl::TexImage3D(image.target, GLint(level), internal, width, height, depth, 0,
+                               format->format, format->type, nullptr);
+                break;
+            }
         }
-        const GLint internal = GLint(format->internal_format);
-        switch (image.target) {
-        case GL_TEXTURE_1D:
-            gl::TexImage1D(GL_TEXTURE_1D, GLint(level), internal, width, 0, format->format,
-                           format->type, nullptr);
-            break;
-        case GL_TEXTURE_1D_ARRAY:
-            gl::TexImage2D(GL_TEXTURE_1D_ARRAY, GLint(level), internal, width, depth, 0,
-                           format->format, format->type, nullptr);
-            break;
-        case GL_TEXTURE_2D:
-            gl::TexImage2D(GL_TEXTURE_2D, GLint(level), internal, width, height, 0, format->format,
-                           format->type, nullptr);
-            break;
-        default:
-            gl::TexImage3D(image.target, GLint(level), internal, width, height, depth, 0,
-                           format->format, format->type, nullptr);
-            break;
+    };
+#ifdef __SWITCH__
+    while (gl::GetError() != 0) {}
+#endif
+    alloc_levels();
+#ifdef __SWITCH__
+    if (GLenum err = gl::GetError(); err == GL_OUT_OF_MEMORY) {
+        Sweep(2);
+        gl::Finish();
+        while (gl::GetError() != 0) {}
+        alloc_levels();
+        err = gl::GetError();
+        static u32 alloc_err_logged = 0;
+        if (err != 0 && alloc_err_logged < 32) {
+            ++alloc_err_logged;
+            nx_platform_trace("GL_ALLOC_ERR(after retry): err=0x%x addr=%#llx tgt=0x%x fmt=%s(0x%x) %ux%ux%u mips=%u comp=%d\n",
+                              err, static_cast<unsigned long long>(info.guest_address),
+                              image.target, vk::to_string(info.pixel_format).c_str(),
+                              format->internal_format, info.size.width, info.size.height,
+                              layers, levels, format->compressed ? 1 : 0);
+        }
+    } else if (err != 0) {
+        static u32 alloc_err_logged = 0;
+        if (alloc_err_logged < 32) {
+            ++alloc_err_logged;
+            nx_platform_trace("GL_ALLOC_ERR: err=0x%x addr=%#llx tgt=0x%x fmt=%s(0x%x) %ux%ux%u mips=%u comp=%d\n",
+                              err, static_cast<unsigned long long>(info.guest_address),
+                              image.target, vk::to_string(info.pixel_format).c_str(),
+                              format->internal_format, info.size.width, info.size.height,
+                              layers, levels, format->compressed ? 1 : 0);
         }
     }
+#endif
 }
 
 Image* TextureCache::Create(const VideoCore::ImageInfo& info, GLenum target) {
@@ -488,14 +531,15 @@ void TextureCache::QueueUnmap(VAddr address, u64 size) {
     pending_unmaps.emplace_back(address, size);
 }
 
-void TextureCache::Sweep() {
+void TextureCache::Sweep(u64 max_unused_frames) {
+    const u64 limit = max_unused_frames == ~0ull ? UnusedFramesBeforeEviction : max_unused_frames;
     std::vector<std::pair<VAddr, u64>> unmaps;
     {
         std::scoped_lock lock{unmap_mutex};
         unmaps.swap(pending_unmaps);
     }
     const auto dead = [&](const Image& image) {
-        if (frame - image.last_used_frame > UnusedFramesBeforeEviction) {
+        if (frame - image.last_used_frame > limit) {
             return true;
         }
         const VAddr begin = image.info.guest_address;
@@ -534,7 +578,12 @@ void TextureCache::NextFrame() {
         std::scoped_lock lock{unmap_mutex};
         has_unmaps = !pending_unmaps.empty();
     }
-    if (has_unmaps || (frame & 255) == 0) {
+#ifdef __SWITCH__
+    constexpr u64 SweepMask = 63;
+#else
+    constexpr u64 SweepMask = 255;
+#endif
+    if (has_unmaps || (frame & SweepMask) == 0) {
         Sweep();
     }
 }

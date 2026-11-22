@@ -107,7 +107,7 @@ private:
     void MarkTarget(Image& image);
     void Upload(Image& image);
     void UploadLevel(Image& image, u32 level, const u8* data, u32 pitch, u32 rows);
-    void Sweep();
+    void Sweep(u64 max_unused_frames = ~0ull);
 
     GlState& state;
     GuestWriteWatch& watch;

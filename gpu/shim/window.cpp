@@ -92,6 +92,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title, GraphicsApi api
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            const char* gl_dbg = std::getenv("DCP_GL_DEBUG");
+            if (gl_dbg && gl_dbg[0] == '1') {
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+            }
         }
 #else
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);

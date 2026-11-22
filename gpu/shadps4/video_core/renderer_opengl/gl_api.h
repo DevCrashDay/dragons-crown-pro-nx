@@ -123,6 +123,9 @@
 // The DepthRangef/DrawElementsInstanced/TexStorage2D are OpenGL ES core calls the desktop path
 // never makes. FramebufferTextureLayer and GetTexLevelParameteriv (ES 3.1) guard attachments.
 using DcpGetTexLevelParameteriv = void(APIENTRY*)(GLenum, GLint, GLenum, GLint*);
+using DcpDebugProc = void(APIENTRY*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
+using DcpDebugMessageCallback = void(APIENTRY*)(DcpDebugProc, const void*);
+using DcpDebugMessageControl = void(APIENTRY*)(GLenum, GLenum, GLenum, GLsizei, const GLuint*, GLboolean);
 
 #define DCP_GL_OPTIONAL_FUNCTIONS(X)                                                               \
     X(PFNGLBLENDEQUATIONSEPARATEIPROC, BlendEquationSeparatei)                                     \
@@ -132,7 +135,9 @@ using DcpGetTexLevelParameteriv = void(APIENTRY*)(GLenum, GLint, GLenum, GLint*)
     X(PFNGLDRAWELEMENTSINSTANCEDPROC, DrawElementsInstanced)                                       \
     X(PFNGLTEXSTORAGE2DPROC, TexStorage2D)                                                         \
     X(PFNGLFRAMEBUFFERTEXTURELAYERPROC, FramebufferTextureLayer)                                   \
-    X(DcpGetTexLevelParameteriv, GetTexLevelParameteriv)
+    X(DcpGetTexLevelParameteriv, GetTexLevelParameteriv)                                           \
+    X(DcpDebugMessageCallback, DebugMessageCallback)                                               \
+    X(DcpDebugMessageControl, DebugMessageControl)
 
 namespace gl {
 

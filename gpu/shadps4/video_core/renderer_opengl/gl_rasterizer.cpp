@@ -279,14 +279,17 @@ bool Rasterizer::FilterDraw() {
     using Mode = AmdGpu::ColorControl::OperationMode;
     const auto mode = regs.color_control.mode;
     if (mode == Mode::EliminateFastClear) {
+        if (trace_file) std::fprintf(trace_file, "OP: EliminateFastClear\n");
         EliminateFastClear();
         return false;
     }
     if (mode == Mode::Resolve) {
+        if (trace_file) std::fprintf(trace_file, "OP: Resolve\n");
         Resolve();
         return false;
     }
     if (mode == Mode::FmaskDecompress || regs.primitive_type == AmdGpu::PrimitiveType::None) {
+        if (trace_file) std::fprintf(trace_file, "OP: Skip mode=%u prim=%u\n", u32(mode), u32(regs.primitive_type));
         return false;
     }
     const bool depth_copy =
@@ -581,6 +584,11 @@ void Rasterizer::BindTexture(const Shader::Info& info,
         const GLenum target = ImageTarget(sharp.GetViewType(desc.is_array));
         state.BindTexture(unit, target, target == GL_TEXTURE_2D ? black_texture : 0);
         state.BindSampler(unit, 0);
+        if (trace_file) {
+            trace_textures.push_back({trace_bind_stage, unit, sharp.Address(), 0, 0, target, 0, 0,
+                                      false, u32(data_format), u32(number_format),
+                                      u8(sharp.base_level), u8(sharp.last_level)});
+        }
         return;
     }
     if (image->is_srgb != (number_format == AmdGpu::NumberFormat::Srgb)) {
@@ -599,6 +607,17 @@ void Rasterizer::BindTexture(const Shader::Info& info,
                                 .base_level = GLint(std::min<u32>(sharp.base_level, last_level)),
                                 .max_level = GLint(std::min<u32>(sharp.last_level, last_level)),
                             });
+    if (trace_file) {
+        GLint gl_w = -1;
+        if (gl::GetTexLevelParameteriv) {
+            state.ActiveTexture(unit);
+            gl::GetTexLevelParameteriv(image->target, 0, GL_TEXTURE_WIDTH, &gl_w);
+        }
+        trace_textures.push_back({trace_bind_stage, unit, image->info.guest_address,
+                                  image->info.size.width, image->info.size.height, image->target,
+                                  image->handle, gl_w, image->gpu_written, u32(data_format),
+                                  u32(number_format), u8(sharp.base_level), u8(sharp.last_level)});
+    }
     if (combined.sampler == Shader::Backend::GLSL::NoSampler) {
         state.BindSampler(unit, 0);
         return;
@@ -1226,8 +1245,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
 
     state.BindSampler(0, 0);
     state.BindTexture(0, shader_ring.TextureTarget(), shader_ring.Texture());
+    if (trace_file) {
+        trace_textures.clear();
+        trace_bind_stage = 'V';
+    }
     BindStage(vs_info, program->vs, program->vertex->glsl);
     if (program->fragment) {
+        if (trace_file) {
+            trace_bind_stage = 'P';
+        }
         BindStage(*program->fragment->info, program->fs, program->fragment->glsl);
     }
     // Elements on OpenGL ES have no base vertex here, and gl_VertexID would not include it anyway.
@@ -1359,6 +1385,71 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
                     count);
 #endif
     }
+    if (trace_file) {
+        const GLenum post_err = gl::GetError();
+        const auto exp = ExpansionOf(regs.primitive_type,
+                                     gles ? Shader::Backend::GLSL::Target::Gles300
+                                          : Shader::Backend::GLSL::Target::Desktop330,
+                                     rect_tables);
+        trace_programs[{program->vertex, program->fragment, exp}]++;
+        const auto ds = Vulkan::GetEffectiveDepthStencilState(regs);
+        std::fprintf(trace_file,
+                     "D#%u vs=%#llx ps=%#llx prim=%u idx=%d cnt=%d inst=%d voff=%u ioff=%u err=0x%x\n",
+                     trace_draw_idx++, static_cast<unsigned long long>(vs_info.pgm_hash),
+                     static_cast<unsigned long long>(
+                         program->fragment ? program->fragment->info->pgm_hash : 0),
+                     u32(regs.primitive_type), is_indexed ? 1 : 0, int(count), int(instances),
+                     vertex_offset, instance_offset, post_err);
+        std::fprintf(trace_file, "  RT:");
+        for (u32 cb = 0; cb < targets.color.size(); ++cb) {
+            if (const Image* im = targets.color[cb]) {
+                std::fprintf(trace_file, " cb%u=%#llx:%ux%u:%s:h%u:w%d", cb,
+                             static_cast<unsigned long long>(im->info.guest_address),
+                             im->info.size.width, im->info.size.height,
+                             vk::to_string(im->info.pixel_format).c_str(), im->handle,
+                             im->gpu_written ? 1 : 0);
+            }
+        }
+        if (const Image* db = targets.depth) {
+            std::fprintf(trace_file, " db=%#llx:%ux%u:%s:h%u:s%d",
+                         static_cast<unsigned long long>(db->info.guest_address),
+                         db->info.size.width, db->info.size.height,
+                         vk::to_string(db->info.pixel_format).c_str(), db->handle,
+                         db->info.props.has_stencil ? 1 : 0);
+        }
+        const auto& bc0 = regs.blend_control[0];
+        std::fprintf(trace_file,
+                     "\n  ST: depth=%d/%d/f%u st=%d/f%u/r%u/m%x cull=%u ff=%u clipD=%d b0=%d(%u,%u,%u) msk=%x\n",
+                     ds.depth_test_enable ? 1 : 0, ds.depth_write_enable ? 1 : 0,
+                     u32(regs.depth_control.depth_func), ds.stencil_test_enable ? 1 : 0,
+                     u32(regs.depth_control.stencil_ref_func), u32(regs.stencil_ref_front.stencil_test_val),
+                     u32(regs.stencil_ref_front.stencil_mask), u32(regs.polygon_control.CullingMode()),
+                     u32(regs.polygon_control.front_face), regs.IsClipDisabled() ? 1 : 0,
+                     bc0.enable ? 1 : 0, u32(bc0.color_src_factor), u32(bc0.color_dst_factor),
+                     u32(bc0.color_func), u32(regs.color_target_mask.GetMask(0)));
+        if (const auto& fetch = program->vertex->spec.fetch_shader_data; fetch && !fetch->attributes.empty()) {
+            std::fprintf(trace_file, "  VTX:");
+            for (const auto& a : fetch->attributes) {
+                const auto b = a.GetSharp(vs_info);
+                const auto vf = Vulkan::LiverpoolToVK::TrySurfaceFormat(b.GetDataFmt(), b.GetNumberFmt());
+                std::fprintf(trace_file, " s%u=%#llx:%s:st%u:sz%u:sr%u", a.semantic,
+                             static_cast<unsigned long long>(b.base_address),
+                             vk::to_string(vf).c_str(), b.GetStride(), b.GetSize(),
+                             u32(a.GetStepRate()));
+            }
+            std::fprintf(trace_file, "\n");
+        }
+        if (!trace_textures.empty()) {
+            std::fprintf(trace_file, "  TEX:");
+            for (const auto& t : trace_textures) {
+                std::fprintf(trace_file, " %c%u=%#llx:%ux%u:df%u/nf%u:t%x:h%u:glW%d:w%d:m%u..%u",
+                             t.stage, t.unit, static_cast<unsigned long long>(t.addr), t.w, t.h,
+                             t.fmt, t.num_fmt, t.target, t.handle, t.gl_w, t.gpu_written ? 1 : 0,
+                             t.base_mip, t.last_mip);
+            }
+            std::fprintf(trace_file, "\n");
+        }
+    }
 }
 
 void Rasterizer::DrawIndirect(bool, VAddr, u32, u32, u32, VAddr, u16, u16) {
@@ -1414,7 +1505,12 @@ bool Rasterizer::TryKnownCompute(const Shader::Info& info) {
 void Rasterizer::DispatchDirect() {
     const auto& cs = liverpool->GetCsRegs();
     const Shader::Info* info = shaders.GetCompute(cs);
-    if (!TryKnownCompute(*info)) {
+    const bool known = TryKnownCompute(*info);
+    if (trace_file) {
+        std::fprintf(trace_file, "OP: DispatchDirect hash=%#llx known=%d\n",
+                     static_cast<unsigned long long>(info->pgm_hash), known ? 1 : 0);
+    }
+    if (!known) {
         Report(fmt::format("compute shader {:#x} was skipped: OpenGL 3.3 has no compute stage",
                            info->pgm_hash));
     }
@@ -1425,6 +1521,10 @@ void Rasterizer::DispatchIndirect(VAddr, u32, u32) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (trace_file) {
+        std::fprintf(trace_file, "OP: FillBuffer addr=%#llx bytes=%u val=0x%x gds=%d\n",
+                     static_cast<unsigned long long>(address), num_bytes, value, is_gds ? 1 : 0);
+    }
     if (is_gds) {
         if (u64(address) + num_bytes <= gds.size()) {
             auto* out = reinterpret_cast<u32*>(gds.data() + address);
@@ -1440,6 +1540,11 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (trace_file) {
+        std::fprintf(trace_file, "OP: CopyBuffer dst=%#llx src=%#llx bytes=%u\n",
+                     static_cast<unsigned long long>(dst), static_cast<unsigned long long>(src),
+                     num_bytes);
+    }
     const auto* source = src_gds ? gds.data() + src : reinterpret_cast<const u8*>(src);
     auto* target = dst_gds ? gds.data() + dst : reinterpret_cast<u8*>(dst);
     if (!dst_gds) {
@@ -1507,9 +1612,55 @@ void Rasterizer::ForgetStreamCopies() {
 }
 
 void Rasterizer::OnFlip() {
+    if (trace_file) {
+        std::fprintf(trace_file, "=== OnFlip (draws_traced=%u) ===\n", trace_draw_idx);
+    }
     watch->AdvanceFrame();
     texture_cache.NextFrame();
     ForgetStreamCopies();
+}
+
+void Rasterizer::BeginDrawTrace(const char* path, u32 frame_num) {
+    if (trace_file) {
+        std::fclose(trace_file);
+        trace_file = nullptr;
+    }
+    trace_draw_idx = 0;
+    trace_programs.clear();
+    trace_file = std::fopen(path, "w");
+    if (trace_file) {
+        std::fprintf(trace_file, "=== DRAW TRACE frame=%u ===\n", frame_num);
+    }
+}
+
+void Rasterizer::EndDrawTrace(const char* shaders_path) {
+    if (!trace_file) {
+        return;
+    }
+    std::fprintf(trace_file, "=== END TRACE draws=%u unique_progs=%zu ===\n", trace_draw_idx,
+                 trace_programs.size());
+    std::fclose(trace_file);
+    trace_file = nullptr;
+    if (shaders_path) {
+        if (std::FILE* sf = std::fopen(shaders_path, "w")) {
+            for (const auto& [key, count] : trace_programs) {
+                const auto& [vs, fs, exp] = key;
+                const auto src = Shader::Backend::GLSL::LinkStages(
+                    vs->glsl, fs ? &fs->glsl : nullptr, exp);
+                std::fprintf(sf, "=== PROG vs=%#llx ps=%#llx exp=%u draws=%u ===\n",
+                             static_cast<unsigned long long>(vs->info->pgm_hash),
+                             static_cast<unsigned long long>(fs ? fs->info->pgm_hash : 0),
+                             u32(exp), count);
+                std::fprintf(sf, "--- VS ---\n%s\n", src.vertex.c_str());
+                if (!src.geometry.empty()) {
+                    std::fprintf(sf, "--- GS ---\n%s\n", src.geometry.c_str());
+                }
+                std::fprintf(sf, "--- PS ---\n%s\n", src.fragment.c_str());
+            }
+            std::fclose(sf);
+        }
+    }
+    trace_programs.clear();
 }
 
 void Rasterizer::ResetState() {
