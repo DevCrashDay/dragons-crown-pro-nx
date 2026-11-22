@@ -59,15 +59,18 @@ static void nx_init_pool_sizes(void) {
         nx_platform_heap_info(&htot, &hfree);
         uint64_t free_mb = hfree >> 20;
         uint64_t budget_mb = (free_mb > h_mb + 64) ? (free_mb - h_mb) : (free_mb * 3 / 4);
+        /* Measured on Ryujinx through the title screen: 2089 MiB direct, 0.25 MiB flexible.
+           Every MiB kept here is missing from Mesa's buffers, and 2304+256 ran Mesa out of
+           memory (GL_OUT_OF_MEMORY, then a throw on the GPU thread). */
         if (!f_mb) {
             f_mb = budget_mb / 8;
-            if (f_mb > 256) f_mb = 256;
-            if (f_mb < 64) f_mb = 64;
+            if (f_mb > 32) f_mb = 32;
+            if (f_mb < 16) f_mb = 16;
             f_mb &= ~UINT64_C(15);
         }
         if (!d_mb) {
             d_mb = (budget_mb > f_mb) ? (budget_mb - f_mb) : 256;
-            if (d_mb > 2304) d_mb = 2304;
+            if (d_mb > 2176) d_mb = 2176;
             if (d_mb < 256) d_mb = 256;
             d_mb &= ~UINT64_C(15);
         }
