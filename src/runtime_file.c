@@ -51,7 +51,11 @@ typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Li
 /* A game file the guest reads with byte ranges replaced and possibly past its end; the host file is never written. */
 typedef struct { uint64_t offset, size; const unsigned char *data; } OverlayPatch;
 typedef struct { char guest[512]; uint64_t length; OverlayPatch *patches; size_t count; } Overlay;
-typedef struct { int used, host; Listing *dir; size_t position; char path[512]; const Overlay *overlay; } File;
+/* A file on FAT32 too big for one file: contiguous DRACRO.CPK.000, .001, ... parts, read as one file. */
+#define SPLIT_MAX 16
+typedef struct { int count; int fd[SPLIT_MAX]; uint64_t start[SPLIT_MAX + 1]; } Split;
+typedef struct { int used, host; Listing *dir; size_t position; char path[512]; const Overlay *overlay;
+                 Split *split; int64_t split_pos; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 #define MAX_OVERLAYS 4
 static File files[MAX_FILES];
@@ -229,6 +233,67 @@ static int host_flags(int flags) {
 #endif
     return r|O_CLOEXEC;
 }
+/* A split file opens its parts in order; the base name itself does not exist. */
+static Split *open_split(const char *path) {
+    Split *s=calloc(1,sizeof(*s));
+    if (!s) return NULL;
+    for (int i=0;i<SPLIT_MAX;++i) {
+        char part[1200];
+        if (snprintf(part,sizeof(part),"%s.%03d",path,i)>=(int)sizeof(part)) break;
+        int fd=open(part,host_flags(0),0);
+        if (fd<0) break;
+        HostStat st;
+        if (host_fstat(fd,&st) || S_ISDIR(st.st_mode)) { close(fd); break; }
+        s->fd[s->count]=fd;
+        s->start[s->count+1]=s->start[s->count]+(uint64_t)st.st_size;
+        ++s->count;
+    }
+    if (!s->count) { free(s); return NULL; }
+    return s;
+}
+static void close_split(Split *s) {
+    if (!s) return;
+    for (int i=0;i<s->count;++i) close(s->fd[i]);
+    free(s);
+}
+static uint64_t split_size(const Split *s) { return s->start[s->count]; }
+static int has_split(const char *path) {
+    char part[1200];
+    if (snprintf(part,sizeof(part),"%s.000",path)>=(int)sizeof(part)) return 0;
+    return access(part,F_OK)==0;
+}
+static int64_t split_pread(const Split *s,void *buffer,uint64_t size,int64_t offset) {
+    if (offset<0) return -EINVAL;
+    const uint64_t total=s->start[s->count];
+    if ((uint64_t)offset>=total) return 0;
+    if (size>total-(uint64_t)offset) size=total-(uint64_t)offset;
+    uint64_t done=0;
+    int part=0;
+    while (part<s->count && s->start[part+1]<=(uint64_t)offset) ++part;
+    while (done<size && part<s->count) {
+        const uint64_t at=(uint64_t)offset+done;
+        const uint64_t part_off=at-s->start[part];
+        uint64_t n=s->start[part+1]-at;
+        if (n>size-done) n=size-done;
+        ssize_t r=pread(s->fd[part],(unsigned char *)buffer+done,n,part_off);
+        if (r<0) return -errno;
+        if (!r) break;
+        done+=(uint64_t)r;
+        if ((uint64_t)r<n) break;
+        ++part;
+    }
+    return (int64_t)done;
+}
+static uint64_t file_host_size(const File *f) {
+    if (f->split) return split_size(f->split);
+    HostStat s;
+    return host_fstat(f->host,&s) ? 0 : (uint64_t)s.st_size;
+}
+static int64_t file_pread(const File *f,void *buffer,uint64_t size,int64_t offset) {
+    if (f->split) return split_pread(f->split,buffer,size,offset);
+    ssize_t n=pread(f->host,buffer,size,offset);
+    return n<0 ? -errno : n;
+}
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
 static Listing *list_directory(const char *path) {
     DIR *d=opendir(path);
@@ -304,13 +369,15 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
-    if ((flags & (3|0x8|0x200|0x400|0x800)) && runtime_savedata_protects(path)) return -EACCES;
+    const int writable=flags & (3|0x8|0x200|0x400|0x800);
+    if (writable && runtime_savedata_protects(path)) return -EACCES;
+    int host=-1;
+    Listing *dir=NULL;
+    Split *split=NULL;
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;
     HostStat s;
-    Listing *dir=NULL;
-    int host=-1;
     if (!host_stat(path,&s) && S_ISDIR(s.st_mode)) {
         if (flags&3) return -EISDIR;
         if (!(dir=list_directory(path))) return -EACCES;
@@ -322,31 +389,36 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         host=open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
         if (host<0) {
             e=errno;
+            if (!writable && !(flags&0x20000) && e==ENOENT) split=open_split(path);
+            if (!split) {
+                if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+                return -e;
+            }
+        } else if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
+    }
+#else
+    host=open(path,host_flags(flags),mode ? mode : 0644);
+    if (host<0) {
+        e=errno;
+        if (!writable && !(flags&0x20000) && e==ENOENT) split=open_split(path);
+        if (!split) {
             if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
             return -e;
         }
-        if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
+    } else {
+        struct stat s;
+        if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
     }
-#else
-    int host=open(path,host_flags(flags),mode ? mode : 0644);
-    if (host<0) {
-        e=errno;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
-        return -e;
-    }
-    struct stat s;
-    Listing *dir=NULL;
-    if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
 #endif
     /* DCP_FILE_TRACE=1: every file the game opens. */
     static int file_trace=-1;
     if (file_trace<0) { const char *t=getenv("DCP_FILE_TRACE"); file_trace=t && t[0]=='1'; }
-    if (file_trace) printf("Runtime: open(%s)%s\n",guest,dir ? " [directory]" : "");
+    if (file_trace) printf("Runtime: open(%s)%s%s\n",guest,split ? " [split]" : "",dir ? " [directory]" : "");
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
-    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
-    files[fd]=(File){.used=1,.host=host,.dir=dir,.overlay=dir ? NULL : overlay_of(guest)};
+    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); close_split(split); free_listing(dir); return -EMFILE; }
+    files[fd]=(File){.used=1,.host=host,.dir=dir,.overlay=dir ? NULL : overlay_of(guest),.split=split};
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
@@ -358,15 +430,11 @@ static int64_t do_close(int fd) {
     File *f=get(fd);
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
     if (f->host>=0) close(f->host);
+    close_split(f->split);
     free_listing(f->dir);
     *f=(File){0};
     pthread_mutex_unlock(&lock);
     return 0;
-}
-static int host_fd(int fd) {
-    if (fd>=0 && fd<3) return fd;
-    File *f=get(fd);
-    return f ? f->host : -1;
 }
 #ifdef _WIN32
 /* The CRT reads and writes at most INT_MAX bytes per call. */
@@ -393,12 +461,10 @@ static int64_t overlay_pread(const File *f,void *buffer,uint64_t size,int64_t of
     if (offset<0) return -EINVAL;
     if ((uint64_t)offset>=o->length) return 0;
     if (size>o->length-(uint64_t)offset) size=o->length-(uint64_t)offset;
-    HostStat s;
-    if (host_fstat(f->host,&s)) return -errno;
-    uint64_t host_end=(uint64_t)s.st_size, filled=0;
+    uint64_t host_end=file_host_size(f), filled=0;
     while (filled<size && (uint64_t)offset+filled<host_end) {
-        ssize_t n=pread(f->host,(unsigned char *)buffer+filled,size-filled,offset+(int64_t)filled);
-        if (n<0) return -errno;
+        int64_t n=file_pread(f,(unsigned char *)buffer+filled,size-filled,offset+(int64_t)filled);
+        if (n<0) return n;
         if (!n) break;
         filled+=(uint64_t)n;
     }
@@ -430,45 +496,144 @@ static void observe_read(int fd,int64_t offset,int64_t n) {
     if (f) observe(path,(uint64_t)offset,(uint64_t)n);
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
-    int h=host_fd(fd);
-    if (h<0) return -EBADF;
+    if (fd>=0 && fd<3) {
+        ssize_t n=host_read(fd,buffer,size);
+        return n<0 ? -errno : n;
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
     touch_for_write(buffer,size);
-    const File *f=get(fd);
-    if (f && f->overlay) {
+    if (f->split) {
+        const int64_t at=f->split_pos;
+        int64_t n=f->overlay ? overlay_pread(f,buffer,size,at)
+                             : split_pread(f->split,buffer,size,at);
+        if (n>0) f->split_pos+=n;
+        if (n>0) {
+            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+            if (rc >= 17 && rc <= 60) {
+                extern void nx_platform_trace(const char *format, ...);
+                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                                  (unsigned long long)rc, fd, (unsigned long long)at,
+                                  (unsigned long long)size, (long long)n);
+            }
+#endif
+        }
+        observe_read(fd,at,n);
+        return n;
+    }
+    const int h=f->host;
+    if (h<0) return -EBADF;
+    if (f->overlay) {
         int64_t at=host_lseek(h,0,SEEK_CUR);
         if (at<0) return -errno;
         int64_t n=overlay_pread(f,buffer,size,at);
         if (n>0 && host_lseek(h,at+n,SEEK_SET)<0) return -errno;
-        if (n>0) { __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED); }
+        if (n>0) {
+            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+            if (rc >= 17 && rc <= 60) {
+                extern void nx_platform_trace(const char *format, ...);
+                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                                  (unsigned long long)rc, fd, (unsigned long long)at,
+                                  (unsigned long long)size, (long long)n);
+            }
+#endif
+        }
         observe_read(fd,at,n);
         return n;
     }
     const int64_t at=observed_position(fd,h);
     ssize_t n=host_read(h,buffer,size);
     if (n<0) return -errno;
-    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+    {
+        uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+        __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+        if (rc >= 17 && rc <= 60) {
+            extern void nx_platform_trace(const char *format, ...);
+            nx_platform_trace("R#%llu(read): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                              (unsigned long long)rc, fd, (unsigned long long)at,
+                              (unsigned long long)size, (long long)n);
+        }
+#endif
+    }
     observe_read(fd,at,n);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
-    int h=host_fd(fd);
-    if (h<0) return -EBADF;
+    if (fd>=0 && fd<3) {
+        ssize_t n=pread(fd,buffer,size,offset);
+        return n<0 ? -errno : n;
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
     touch_for_write(buffer,size);
-    const File *f=get(fd);
-    if (f && f->overlay) {
+    if (f->split) {
+        int64_t n=f->overlay ? overlay_pread(f,buffer,size,offset)
+                             : split_pread(f->split,buffer,size,offset);
+        if (n>0) {
+            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+            if (rc >= 17 && rc <= 60) {
+                extern void nx_platform_trace(const char *format, ...);
+                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                                  (unsigned long long)rc, fd, (unsigned long long)offset,
+                                  (unsigned long long)size, (long long)n);
+            }
+#endif
+        }
+        observe_read(fd,offset,n);
+        return n;
+    }
+    const int h=f->host;
+    if (h<0) return -EBADF;
+    if (f->overlay) {
         int64_t n=overlay_pread(f,buffer,size,offset);
-        if (n>0) { __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED); }
+        if (n>0) {
+            uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+            if (rc >= 17 && rc <= 60) {
+                extern void nx_platform_trace(const char *format, ...);
+                nx_platform_trace("R#%llu(split): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                                  (unsigned long long)rc, fd, (unsigned long long)offset,
+                                  (unsigned long long)size, (long long)n);
+            }
+#endif
+        }
         observe_read(fd,offset,n);
         return n;
     }
     ssize_t n=pread(h,buffer,size,offset);
     if (n<0) return -errno;
-    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+    {
+        uint64_t rc = __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+        __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
+#ifdef __SWITCH__
+        if (rc >= 17 && rc <= 60) {
+            extern void nx_platform_trace(const char *format, ...);
+            nx_platform_trace("R#%llu(pread): fd=%d off=0x%llx sz=%llu ret=%lld\n",
+                              (unsigned long long)rc, fd, (unsigned long long)offset,
+                              (unsigned long long)size, (long long)n);
+        }
+#endif
+    }
     observe_read(fd,offset,n);
     return n;
 }
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
-    int h=host_fd(fd);
+    if (fd>=0 && fd<3) {
+        ssize_t n=host_write(fd,buffer,size);
+        return n<0 ? -errno : n;
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
+    if (f->split) return -EROFS;
+    const int h=f->host;
     if (h<0) return -EBADF;
     ssize_t n=host_write(h,buffer,size);
     if (n<0) return -errno;
@@ -476,7 +641,14 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     return n;
 }
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
-    int h=host_fd(fd);
+    if (fd>=0 && fd<3) {
+        ssize_t n=pwrite(fd,buffer,size,offset);
+        return n<0 ? -errno : n;
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
+    if (f->split) return -EROFS;
+    const int h=f->host;
     if (h<0) return -EBADF;
     ssize_t n=pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
@@ -490,29 +662,53 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
+    if (f->split) {
+        const int64_t base = whence==2 ? (f->overlay ? (int64_t)f->overlay->length : (int64_t)file_host_size(f))
+                              : whence==1 ? f->split_pos : 0;
+        const int64_t to=base+offset;
+        if (to<0) return -EINVAL;
+        f->split_pos=to;
+        return to;
+    }
     if (f->overlay && whence==2) { offset+=(int64_t)f->overlay->length; whence=0; }
     int64_t r=host_lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
-    int h=host_fd(fd);
+    if (fd>=0 && fd<3) {
+        HostStat s;
+        if (!out) return -EFAULT;
+        if (host_fstat(fd,&s)) return -errno;
+        convert_stat(&s,out);
+        return 0;
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
+    if (!out) return -EFAULT;
+    if (f->split) {
+        HostStat s;
+        if (host_fstat(f->split->fd[0],&s)) return -errno;
+        convert_stat(&s,out);
+        out->size=(int64_t)split_size(f->split);
+        out->blocks=(out->size+511)/512;
+        if (f->overlay) { out->size=(int64_t)f->overlay->length; out->blocks=(out->size+511)/512; }
+        return 0;
+    }
+    int h=f->host;
     HostStat s;
 #ifdef _WIN32
     if (h<0) { /* directory: a listing only, stat the path it was opened with */
-        File *f=get(fd); char path[1024];
-        if (!f || !f->dir) return -EBADF;
-        if (!out) return -EFAULT;
+        char path[1024];
+        if (!f->dir) return -EBADF;
         if (translate(f->path,path,sizeof(path)) || host_stat(path,&s)) return -EBADF;
         convert_stat(&s,out); return 0;
     }
 #else
     if (h<0) return -EBADF;
 #endif
-    if (!out) return -EFAULT;
     if (host_fstat(h,&s)) return -errno;
     convert_stat(&s,out);
-    const File *f=get(fd);
-    if (f && f->overlay) { out->size=(int64_t)f->overlay->length; out->blocks=(out->size+511)/512; }
+    if (f->overlay) { out->size=(int64_t)f->overlay->length; out->blocks=(out->size+511)/512; }
     return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
@@ -520,7 +716,22 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (!out) return -EFAULT;
-    if (host_stat(path,&s)) return -errno;
+    if (host_stat(path,&s)) {
+        if (errno!=ENOENT) return -errno;
+        Split *sp=open_split(path);
+        if (!sp) return -ENOENT;
+        HostStat first;
+        const int ok=!host_fstat(sp->fd[0],&first);
+        const uint64_t size=split_size(sp);
+        close_split(sp);
+        if (!ok) return -EIO;
+        convert_stat(&first,out);
+        out->size=(int64_t)size;
+        out->blocks=(out->size+511)/512;
+        const Overlay *o=overlay_of(guest);
+        if (o) { out->size=(int64_t)o->length; out->blocks=(out->size+511)/512; }
+        return 0;
+    }
     convert_stat(&s,out);
     const Overlay *o=overlay_of(guest);
     if (o && !S_ISDIR(s.st_mode)) { out->size=(int64_t)o->length; out->blocks=(out->size+511)/512; }
@@ -579,7 +790,17 @@ static int64_t do_rename(const char *from,const char *to) {
 #endif
 }
 static int64_t do_ftruncate(int fd,int64_t length) {
-    int h=host_fd(fd);
+    if (fd>=0 && fd<3) {
+#ifdef _WIN32
+        return _chsize_s(fd,length) ? -errno : 0;
+#else
+        return ftruncate(fd,length) ? -errno : 0;
+#endif
+    }
+    File *f=get(fd);
+    if (!f) return -EBADF;
+    if (f->split) return -EROFS;
+    int h=f->host;
     if (h<0) return -EBADF;
 #ifdef _WIN32
     return _chsize_s(h,length) ? -errno : 0;
@@ -603,21 +824,40 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     return truncate(path,length) ? -errno : 0;
 #endif
 }
-static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
+static int64_t do_fsync(int fd) {
+    if (fd>=0 && fd<3) return fsync(fd) ? -errno : 0;
+    File *f=get(fd);
+    if (!f) return -EBADF;
+    if (f->split) return 0; /* read-only */
+    if (f->host<0) return -EBADF;
+    return fsync(f->host) ? -errno : 0;
+}
 static int64_t do_access(const char *guest,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
 #ifdef _WIN32
-    return access(path,mode&6) ? -errno : 0; /* X_OK is invalid for the CRT */
+    if (access(path,mode&6)) {
+        if (errno==ENOENT && has_split(path)) return (mode&2) ? -EACCES : 0;
+        return -errno;
+    }
+    return 0;
 #else
-    return access(path,mode&7) ? -errno : 0;
+    if (access(path,mode&7)) {
+        if (errno==ENOENT && has_split(path)) return (mode&2) ? -EACCES : 0;
+        return -errno;
+    }
+    return 0;
 #endif
 }
 
 /* Convention adapters: sceKernel* -> Orbis error codes, POSIX -> -1 + errno. */
 static int64_t sce(int64_t r) { return r<0 ? ERR(runtime_guest_errno((int)-r)) : r; }
 static int64_t posix(int64_t r) { if (r<0) { *runtime_errno()=runtime_guest_errno((int)-r); return -1; } return r; }
+#ifdef __SWITCH__
+#define posix_close dcp_posix_close
+#define posix_getdents dcp_posix_getdents
+#endif
 #define PAIR(name,params,args) \
     static ABI int64_t sce_##name params { return sce(do_##name args); } \
     static ABI int64_t posix_##name params { return posix(do_##name args); }
@@ -678,6 +918,10 @@ int64_t runtime_file_stat(const char *p,void *s) { return do_stat(p,s); }
 int64_t runtime_file_fstat(int fd,void *s) { return do_fstat(fd,s); }
 int64_t runtime_file_getdents(int fd,char *b,uint64_t n,int64_t *base) { return do_getdents(fd,b,n,base); }
 int runtime_file_translate(const char *guest,char *out,size_t size) { return translate(guest,out,size); }
+void runtime_file_stats(uint64_t *out_reads, uint64_t *out_bytes) {
+    if (out_reads) *out_reads = (uint64_t)reads;
+    if (out_bytes) *out_bytes = bytes_read;
+}
 void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);

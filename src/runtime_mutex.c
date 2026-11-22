@@ -136,7 +136,24 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
+#ifdef __SWITCH__
+    int r = ETIMEDOUT;
+    for (;;) {
+        r = pthread_mutex_trylock(&(*mutex)->native);
+        if (r != EBUSY) break;
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > end.tv_sec || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
+            r = ETIMEDOUT;
+            break;
+        }
+        struct timespec nap = {0, 100000};
+        nanosleep(&nap, NULL);
+    }
+    e = timed_error(r);
+#else
     e = timed_error(pthread_mutex_timedlock(&(*mutex)->native, &end));
+#endif
     if (!e) ++locks;
     return e;
 }

@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __SWITCH__
+#include "nx/x64_exec.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -28,6 +31,12 @@ typedef struct HostFiber {
 #else
     void *stack, *sp; /* sp: saved stack pointer while the fiber is not running */
     size_t stack_size;
+#endif
+#ifdef __SWITCH__
+    void *guest_stack;       /* guest x86 stack, kept out of the host stack it shares a name with */
+    size_t guest_stack_size;
+    uint64_t guest_stack_top;
+    NxX64FiberEmus *emus;    /* Box64 state of this fiber, active only while it runs */
 #endif
     void *guest;
     FiberEntry entry;
@@ -79,6 +88,84 @@ static int host_thread_prepare(void) {
 static void host_run_fiber(HostFiber *to) { SwitchToFiber(to->fiber); }
 static void host_switch_fiber(HostFiber *from, HostFiber *to) { (void)from; SwitchToFiber(to->fiber); }
 static void host_return_to_thread(HostFiber *from) { (void)from; SwitchToFiber(fiber_tls.thread_fiber); }
+#elif defined(__SWITCH__)
+void dcp_fiber_switch(void **save, void *to);
+void dcp_fiber_start(void);
+__asm__(".text\n.globl dcp_fiber_switch\n.type dcp_fiber_switch,%function\ndcp_fiber_switch:\n"
+        " sub sp, sp, #112\n"
+        " stp x19, x20, [sp, #0]\n"
+        " stp x21, x22, [sp, #16]\n"
+        " stp x23, x24, [sp, #32]\n"
+        " stp x25, x26, [sp, #48]\n"
+        " stp x27, x28, [sp, #64]\n"
+        " stp x29, x30, [sp, #80]\n"
+        " mov x9, sp\n"
+        " str x9, [x0]\n"
+        " mov sp, x1\n"
+        " ldp x19, x20, [sp, #0]\n"
+        " ldp x21, x22, [sp, #16]\n"
+        " ldp x23, x24, [sp, #32]\n"
+        " ldp x25, x26, [sp, #48]\n"
+        " ldp x27, x28, [sp, #64]\n"
+        " ldp x29, x30, [sp, #80]\n"
+        " add sp, sp, #112\n"
+        " ret\n"
+        ".globl dcp_fiber_start\n.type dcp_fiber_start,%function\ndcp_fiber_start:\n"
+        " mov x0, x19\n"
+        " blr x20\n"
+        " brk #0\n");
+
+static void fiber_main(HostFiber *f) {
+    /* Guest code runs on its own stack through Box64; the host stack carries the interpreter. */
+    nx_x64_call(NULL, (uint64_t)(uintptr_t)f->entry, f->guest_stack_top, 0,
+                f->arg_on_initialize, f->arg_to_deliver, 0, 0);
+    fiber_returned(f);
+}
+static int host_fiber_create(HostFiber *f, size_t size) {
+    f->stack_size = (size + 16383) & ~(size_t)16383;
+    f->stack = runtime_stack_acquire(f->stack_size);
+    f->guest_stack_size = f->stack_size;
+    f->guest_stack = runtime_stack_acquire(f->guest_stack_size);
+    f->emus = nx_x64_fiber_emus_new();
+    if (!f->stack || !f->guest_stack || !f->emus) {
+        if (f->stack) runtime_stack_release(f->stack, f->stack_size);
+        if (f->guest_stack) runtime_stack_release(f->guest_stack, f->guest_stack_size);
+        nx_x64_fiber_emus_free(f->emus);
+        f->stack = f->guest_stack = NULL;
+        f->emus = NULL;
+        return 0;
+    }
+    f->guest_stack_top = (uint64_t)(uintptr_t)((char *)f->guest_stack + f->guest_stack_size - 64);
+    uint64_t *frame = (uint64_t *)((char *)f->stack + f->stack_size - 112);
+    memset(frame, 0, 112);
+    frame[0] = (uint64_t)(uintptr_t)f;
+    frame[1] = (uint64_t)(uintptr_t)fiber_main;
+    frame[11] = (uint64_t)(uintptr_t)dcp_fiber_start;
+    f->sp = frame;
+    return 1;
+}
+static void host_fiber_destroy(HostFiber *f) {
+    runtime_stack_release(f->stack, f->stack_size);
+    runtime_stack_release(f->guest_stack, f->guest_stack_size);
+    nx_x64_fiber_emus_free(f->emus);
+    f->emus = NULL;
+}
+static int host_thread_prepare(void) { return 1; }
+static void host_run_fiber(HostFiber *to) {
+    nx_x64_fiber_emus_activate(to->emus);
+    dcp_fiber_switch(&fiber_tls.thread_sp, to->sp);
+    nx_x64_fiber_emus_activate(NULL); /* the fiber returned to the thread */
+}
+static void host_switch_fiber(HostFiber *from, HostFiber *to) {
+    nx_x64_fiber_emus_activate(to->emus);
+    dcp_fiber_switch(&from->sp, to->sp);
+    nx_x64_fiber_emus_activate(from->emus); /* this fiber was resumed */
+}
+static void host_return_to_thread(HostFiber *from) {
+    nx_x64_fiber_emus_activate(NULL);
+    dcp_fiber_switch(&from->sp, fiber_tls.thread_sp);
+    nx_x64_fiber_emus_activate(from->emus); /* resumed by a later Run/Switch */
+}
 #else
 /* dcp_fiber_switch(&save, to): pushes the callee-saved registers and the SSE/x87 control words on the current stack,
  * stores its pointer in *save and continues on `to`, a stack prepared the same way. */

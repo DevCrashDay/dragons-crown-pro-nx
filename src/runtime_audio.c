@@ -55,6 +55,13 @@ static void sleep_until(uint64_t deadline) {
 #ifdef _WIN32
     /* winpthreads' clock_nanosleep only takes CLOCK_REALTIME (EINVAL otherwise). */
     for (uint64_t now=now_ns(); now<deadline; now=now_ns()) compat_sleep_ns(deadline-now);
+#elif defined(__SWITCH__)
+    uint64_t now = now_ns();
+    if (deadline > now) {
+        uint64_t dt = deadline - now;
+        struct timespec t = {(time_t)(dt / 1000000000u), (long)(dt % 1000000000u)};
+        nanosleep(&t, NULL);
+    }
 #else
     struct timespec t={(time_t)(deadline/1000000000u),(long)(deadline%1000000000u)};
     while (clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&t,NULL)) {}
@@ -136,6 +143,21 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     p->sample_bytes=p->is_float ? 4 : 2; p->frames=(int)length; p->std_layout=format>=6;
     for (int c=0;c<8;++c) p->volume[c]=VOLUME_0DB;
     if (sdl_audio()) {
+#ifdef __SWITCH__
+        p->downmix = (p->channels == 8);
+        SDL_AudioSpec want = {0};
+        want.freq = 48000;
+        want.format = AUDIO_S16LSB;
+        want.channels = (Uint8)(p->downmix ? 2 : p->channels);
+        want.samples = 1024;
+        SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (dev) {
+            SDL_PauseAudioDevice(dev, 0);
+            p->stream = (SDL_AudioStream *)(uintptr_t)dev;
+        } else {
+            fprintf(stderr,"Runtime: SDL2 audio open failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+        }
+#else
         SDL_AudioSpec device; int device_frames;
         p->downmix=p->channels==8 && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&device,&device_frames)
                    && device.channels==2;
@@ -143,6 +165,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
         p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
         if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
         else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+#endif
     }
     p->stats=getenv("DCP_AUDIO_STATS")!=NULL;
     const char *dump=getenv("DCP_AUDIO_DUMP");
@@ -163,7 +186,11 @@ static ABI int32_t audio_close(int32_t handle) {
     Port *p=port_of(handle,&error);
     if (p) {
         pthread_mutex_lock(&p->lock);
+#ifdef __SWITCH__
+        if (p->stream) SDL_CloseAudioDevice((SDL_AudioDeviceID)(uintptr_t)p->stream);
+#else
         if (p->stream) SDL_DestroyAudioStream(p->stream);
+#endif
         if (p->dump) fclose(p->dump);
         p->dump=NULL;
         p->stream=NULL; p->used=0;
@@ -194,6 +221,20 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
         }
         if (p->downmix) bytes=downmix_stereo(converted,(size_t)p->frames,p->is_float);
+#ifdef __SWITCH__
+        if (p->is_float) {
+            size_t n = bytes / 4;
+            int16_t *dst = (int16_t *)converted;
+            for (size_t i = 0; i < n; ++i) {
+                float v;
+                memcpy(&v, converted + i * 4, 4);
+                if (v < -1.0f) v = -1.0f;
+                else if (v > 1.0f) v = 1.0f;
+                dst[i] = (int16_t)(v * 32767.0f);
+            }
+            bytes = n * 2;
+        }
+#endif
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {
             uint64_t now=now_ns();

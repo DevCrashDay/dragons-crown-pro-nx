@@ -73,6 +73,9 @@ static int64_t local_offset(uint64_t utc) {
     time_t seconds=(time_t)((int64_t)(utc-UNIX_EPOCH_TICKS)/1000000);
 #ifdef _WIN32
     return (int64_t)compat_utc_offset(seconds)*1000000;
+#elif defined(__SWITCH__)
+    (void)seconds;
+    return 0;
 #else
     struct tm local;
     localtime_r(&seconds,&local);

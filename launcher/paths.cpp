@@ -93,6 +93,16 @@ bool ExecutableDirectory(fs::path& dir) {
     dir = fs::path(module.substr(0, length)).parent_path();
     return true;
 }
+#elif defined(__SWITCH__)
+/* Horizon has no /proc: the .nro and its folders live under this fixed SD path. */
+bool ExecutableDirectory(fs::path& dir) {
+    dir = fs::path("sdmc:/switch/dragons_crown_pro");
+    return true;
+}
+
+bool Writable(const fs::path&) { return true; }
+
+fs::path PortableRoot(const fs::path& exe_dir) { return exe_dir; }
 #else
 bool ExecutableDirectory(fs::path& dir) {
     std::error_code ec;

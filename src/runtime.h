@@ -10,6 +10,10 @@ typedef dcp_jmp_buf sigjmp_buf;
 #define sigsetjmp(buffer, save) dcp_setjmp(buffer)
 #else
 #include <setjmp.h>
+#ifdef __SWITCH__
+typedef jmp_buf sigjmp_buf;
+#define sigsetjmp(buffer, save) setjmp(buffer)
+#endif
 #endif
 /* Recovery point for speculative guest memory reads on this thread (probe.c fault handler). */
 extern __thread sigjmp_buf *runtime_fault_recover;

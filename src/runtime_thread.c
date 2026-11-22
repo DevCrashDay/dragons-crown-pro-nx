@@ -7,6 +7,9 @@
  * the same 9-byte instruction with another displacement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#ifdef __SWITCH__
+#include "nx/x64_exec.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +21,8 @@
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <sys/mman.h>
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
@@ -128,7 +133,11 @@ static void set_gs(void *base) {
 #define tls_block_alloc(size) _aligned_malloc(size,64)
 #else
 static void set_gs(void *base) {
+#ifdef __SWITCH__
+    nx_x64_set_tls_base((uint64_t)(uintptr_t)base); /* Box64 GS base for this host thread */
+#else
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
+#endif
 }
 #define tls_block_alloc(size) aligned_alloc(64,size)
 #endif
@@ -318,7 +327,20 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+#ifdef __SWITCH__
+    extern __thread int g_nx_guest_worker_id;
+    static int g_next_worker_id = 0;
+    if (!strcmp(t->name, "guest")) {
+        g_nx_guest_worker_id = __atomic_add_fetch(&g_next_worker_id, 1, __ATOMIC_RELAXED);
+    }
+    /* Guest code runs in Box64 on its own stack; the host stack carries the emulator. */
+    if (!exit_setjmp(t))
+        t->result=(void *)(uintptr_t)nx_x64_call(NULL,(uint64_t)(uintptr_t)t->entry,
+            (uint64_t)(uintptr_t)(t->stack+t->stack_size),0,(uint64_t)(uintptr_t)t->argument,0,0,0);
+    g_nx_guest_worker_id = 0;
+#else
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
+#endif
     runtime_thread_keys_cleanup();
     pthread_once(&finished_cond_once,finished_cond_init);
     pthread_mutex_lock(&lock); t->finished=1; ++exited;
@@ -327,6 +349,12 @@ static void *host_start(void *p) {
 #endif
     pthread_cond_broadcast(&finished_cond);
     pthread_mutex_unlock(&lock);
+#ifdef __SWITCH__
+    if (!strcmp(t->name, "guest")) {
+        extern void nx_platform_trace(const char *format, ...);
+        nx_platform_trace("Thread '%s' exited: entry=%p result=%p\n", t->name, (void *)t->entry, t->result);
+    }
+#endif
     return t->result;
 }
 static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name) {
@@ -351,8 +379,14 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     reap_detached();
     stack_bytes=(stack_bytes+16383)&~(size_t)16383;
     t->stack=runtime_stack_acquire(stack_bytes);
+#ifdef __SWITCH__
+    if (!t->stack) { fprintf(stderr,"STOP: guest stack allocation failed\n"); exit(21); }
+    t->stack_size=stack_bytes;
+    pthread_attr_setstacksize(&host,1024*1024);
+#else
     if (t->stack) { t->stack_size=stack_bytes; pthread_attr_setstack(&host,t->stack,stack_bytes); }
     else pthread_attr_setstacksize(&host,stack_bytes);
+#endif
 #endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
@@ -365,6 +399,12 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
 #endif
     pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
     printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
+#ifdef __SWITCH__
+    if (!strcmp(t->name, "guest")) {
+        extern void nx_platform_trace(const char *format, ...);
+        nx_platform_trace("Thread '%s' created: entry=%p arg=%p\n", t->name, (void *)entry, argument);
+    }
+#endif
     return 0;
 }
 static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry entry,void *argument,const char *name) {
@@ -418,6 +458,12 @@ static ABI int32_t thread_cancel(GuestThread *t) {
     int still_running=!t->finished;
     pthread_mutex_unlock(&lock);
     if (still_running) puts("Runtime: scePthreadCancel: thread still running after the 2s grace period, left to finish on its own");
+#ifdef __SWITCH__
+    {
+        extern void nx_platform_trace(const char *format, ...);
+        nx_platform_trace("Cancel '%s': finished=%d still=%d\n", t->name, t->finished, still_running);
+    }
+#endif
     return 0;
 }
 static ABI __attribute__((noreturn)) void thread_exit(void *value) {

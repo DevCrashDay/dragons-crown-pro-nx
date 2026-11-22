@@ -2,6 +2,9 @@
  * Units: scales are pixels per em (FreeType char size at 72 dpi); metrics are float pixels. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#ifdef __SWITCH__
+#include "nx/x64_exec.h"
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -188,7 +191,11 @@ static ABI int32_t font_memory_term(FontMemory *memory) {
         typedef void (ABI *Destroy)(FontMemory *, void *, void *);
         Destroy destroy=(Destroy)memory->destroy_callback;
         memory->kind=0;
+#ifdef __SWITCH__
+        NX_GUEST_CALL(destroy,memory,memory->mspace,memory->destroy_object,0);
+#else
         destroy(memory,memory->mspace,memory->destroy_object);
+#endif
         return FONT_OK;
     }
     memset(memory,0,sizeof(*memory));

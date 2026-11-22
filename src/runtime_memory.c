@@ -17,6 +17,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#ifdef __SWITCH__
+#include "nx/nx_platform.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include "runtime_log.h"
@@ -36,8 +39,50 @@ static uint64_t pool_size_bytes(void) {
     }
     return size;
 }
+#ifdef __SWITCH__
+/* Switch has no way to map a host range at a PS4 virtual address, so guest VAs are host
+ * pointers (see place()). The pool therefore has to match what was really allocated.
+ * Size adaptively from free heap minus headroom (for Mesa + Box64 JIT + stacks). */
+static uint64_t nx_dmem_size, nx_fmem_size;
+static void nx_init_pool_sizes(void) {
+    if (nx_dmem_size) return;
+    const char *env_d = getenv("DCP_NX_DMEM_MB");
+    const char *env_f = getenv("DCP_NX_FMEM_MB");
+    const char *env_h = getenv("DCP_NX_HEADROOM_MB");
+    const char *cpu_only = getenv("DCP_CPU_ONLY");
+    uint64_t d_mb = env_d ? strtoull(env_d, NULL, 10) : 0;
+    uint64_t f_mb = env_f ? strtoull(env_f, NULL, 10) : 0;
+    uint64_t h_mb = env_h ? strtoull(env_h, NULL, 10)
+                          : ((cpu_only && *cpu_only && strcmp(cpu_only, "0")) ? 128 : 512);
+    if (!d_mb || !f_mb) {
+        uint64_t htot = 0, hfree = 0;
+        nx_platform_heap_info(&htot, &hfree);
+        uint64_t free_mb = hfree >> 20;
+        uint64_t budget_mb = (free_mb > h_mb + 64) ? (free_mb - h_mb) : (free_mb * 3 / 4);
+        if (!f_mb) {
+            f_mb = budget_mb / 8;
+            if (f_mb > 256) f_mb = 256;
+            if (f_mb < 64) f_mb = 64;
+            f_mb &= ~UINT64_C(15);
+        }
+        if (!d_mb) {
+            d_mb = (budget_mb > f_mb) ? (budget_mb - f_mb) : 256;
+            if (d_mb > 2304) d_mb = 2304;
+            if (d_mb < 256) d_mb = 256;
+            d_mb &= ~UINT64_C(15);
+        }
+    }
+    nx_dmem_size = d_mb * 1024 * 1024;
+    nx_fmem_size = f_mb * 1024 * 1024;
+}
+static uint64_t nx_pool_size_bytes(void) { nx_init_pool_sizes(); return nx_dmem_size; }
+static uint64_t nx_flexible_size_bytes(void) { nx_init_pool_sizes(); return nx_fmem_size; }
+#define POOL_SIZE nx_pool_size_bytes()
+#define FLEXIBLE_SIZE nx_flexible_size_bytes()
+#else
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
+#endif
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
@@ -50,7 +95,12 @@ static uint64_t pool_size_bytes(void) {
 #define MAP_NO_OVERWRITE 0x80
 enum { KIND_RESERVED=1, KIND_DIRECT, KIND_FLEXIBLE };
 typedef struct { uint64_t start, size; int type, used; } Block;
-typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; } Vma;
+typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys;
+#ifdef __SWITCH__
+                 /* 1 when the bytes live at `start` (a Switch reservation), not in the direct pool. */
+                 int owned_data;
+#endif
+               } Vma;
 typedef struct {
     uintptr_t start, end; uint64_t offset; int32_t protection, memory_type;
     uint32_t flags; char name[32];
@@ -78,10 +128,13 @@ static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock)
 static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 static int pool_fd=-1;
 #endif
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
+#ifdef __SWITCH__
+static unsigned char *flex_base;
+#endif
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
 /* GPU hooks (dcpgpu): notified outside the lock, in order, after each operation. */
@@ -268,6 +321,66 @@ static int pool(void) {
     }
     return 0;
 }
+#elif defined(__SWITCH__)
+#include <malloc.h>
+#include <unistd.h>
+static unsigned char *nx_alloc_contiguous_sbrk(size_t total_bytes) {
+    uintptr_t cur = (uintptr_t)sbrk(0);
+    if (cur == (uintptr_t)-1) return NULL;
+    size_t pad = (PAGE - (cur & (PAGE - 1))) & (PAGE - 1);
+    if (pad && sbrk((ptrdiff_t)pad) == (void *)-1) return NULL;
+    unsigned char *base = (unsigned char *)sbrk(0);
+    size_t done = 0;
+    while (done < total_bytes) {
+        size_t chunk = total_bytes - done;
+        if (chunk > (512ULL << 20)) chunk = (512ULL << 20);
+        void *p = sbrk((ptrdiff_t)chunk);
+        if (p == (void *)-1 || (unsigned char *)p != base + done) return NULL;
+        done += chunk;
+    }
+    return base;
+}
+static int pool(void) {
+    if (backing_base) return 0;
+    /* Direct pool uses contiguous sbrk chunks so it can exceed dlmalloc's 2 GiB single-alloc limit. */
+    nx_init_pool_sizes();
+    const uint64_t d_bytes = align_up(nx_dmem_size, PAGE);
+    const uint64_t f_bytes = align_up(nx_fmem_size, PAGE);
+    nx_platform_trace("Memory: reserving %llu MiB (%llu+%llu) of %llu MiB process RAM\n",
+                      (unsigned long long)((d_bytes + f_bytes) >> 20),
+                      (unsigned long long)(d_bytes >> 20),
+                      (unsigned long long)(f_bytes >> 20),
+                      (unsigned long long)(nx_platform_total_ram_bytes() >> 20));
+    backing_base = nx_alloc_contiguous_sbrk((size_t)d_bytes);
+    if (backing_base) flex_base = (unsigned char *)memalign(PAGE, (size_t)f_bytes);
+    if (!backing_base || !flex_base) {
+        uint64_t htot = 0, hfree = 0;
+        nx_platform_heap_info(&htot, &hfree);
+        nx_platform_trace("Memory: allocation FAILED: %llu MiB (free heap %llu MiB / %llu MiB)\n",
+                          (unsigned long long)((d_bytes + f_bytes) >> 20),
+                          (unsigned long long)(hfree >> 20),
+                          (unsigned long long)(htot >> 20));
+        fprintf(stderr, "Runtime: cannot allocate %" PRIu64 " MiB guest memory on Switch (free heap %" PRIu64 " MiB)\n",
+                (d_bytes + f_bytes) >> 20, hfree >> 20);
+        return -1;
+    }
+    printf("Runtime: guest memory ready: %" PRIu64 " MiB direct + %" PRIu64 " MiB flexible\n",
+           POOL_SIZE >> 20, FLEXIBLE_SIZE >> 20);
+    nx_platform_trace("Memory: ready: %llu MiB direct + %llu MiB flexible\n",
+                      (unsigned long long)(POOL_SIZE >> 20),
+                      (unsigned long long)(FLEXIBLE_SIZE >> 20));
+    return 0;
+}
+void runtime_memory_reserve(void) {}
+static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+    (void)address; (void)size; (void)prot; (void)reserved; (void)phys;
+    return 0;
+}
+static int host_unmap(uintptr_t address, uint64_t size) { (void)address; (void)size; return 0; }
+static int host_protect(uintptr_t address, uint64_t size, int prot) { (void)address; (void)size; (void)prot; return 0; }
+static void host_discard(uint64_t phys, uint64_t size) {
+    if (backing_base) memset(backing_base + phys, 0, (size_t)size);
+}
 #else
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
@@ -439,6 +552,29 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
     uintptr_t address=(uintptr_t)*inout;
+    int owned_data=0;
+#ifdef __SWITCH__
+    (void)alignment; /* host pointers come from the pool, not from an address search */
+    /* Guest virtual addresses are host pointers: the Switch has no way to map a host range at a
+     * PS4 virtual address. Direct and flexible mappings therefore live in the pool block, and a
+     * reservation gets its own block that a later commit reuses in place. */
+    if (kind==KIND_RESERVED) {
+        address=(uintptr_t)memalign(PAGE,(size_t)size);
+        if (!address) return NO_MEMORY;
+        owned_data=1;
+    } else {
+        address=(uintptr_t)(kind==KIND_FLEXIBLE ? (flex_base+(phys-POOL_SIZE)) : (backing_base+phys));
+        if ((flags & MAP_FIXED_FLAG) && (uintptr_t)*inout) {
+            const uintptr_t hint=(uintptr_t)*inout;
+            const size_t i=vma_index(hint);
+            if (!(hint%PAGE) && i<vma_count && vmas[i].kind==KIND_RESERVED &&
+                vmas[i].start<=hint && hint+size<=vmas[i].end) {
+                address=hint;  /* commit at the reserved address: keep its memory */
+                owned_data=1;
+            }
+        }
+    }
+#else
     if (flags & MAP_FIXED_FLAG) {
         if (!address || address%PAGE) return INVALID;
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return NO_MEMORY;
@@ -447,9 +583,15 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         if (!address) return NO_MEMORY;
     }
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
+#endif
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    Vma v={0};
+    v.start=address; v.end=address+size; v.kind=kind; v.prot=prot; v.type=type; v.phys=phys;
+#ifdef __SWITCH__
+    v.owned_data=owned_data;
+#endif
+    if (vma_insert(vma_index(address),v)) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -484,14 +626,23 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
-    if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
+    if ((uint64_t)low >= end || size > end - (uint64_t)low) {
+        fprintf(stderr, "Runtime: direct_allocate NO_SPACE (range) size=%" PRIu64 " live=%" PRIu64 "/%" PRIu64 "\n",
+                size, live_bytes, POOL_SIZE);
+        return NO_SPACE;
+    }
     write_lock();
     if (pool()) { write_unlock(); return NO_MEMORY; }
     uint64_t start = align_up((uint64_t)low, alignment);
     int slot = -1;
     for (int i=0; i<LIMIT; ++i) if (!blocks[i].used) { slot=i; break; }
     for (;;) {
-        if (slot<0 || start > end || size > end-start) { write_unlock(); return NO_SPACE; }
+        if (slot<0 || start > end || size > end-start) {
+            write_unlock();
+            fprintf(stderr, "Runtime: direct_allocate NO_SPACE (full) size=%" PRIu64 " live=%" PRIu64 "/%" PRIu64 "\n",
+                    size, live_bytes, POOL_SIZE);
+            return NO_SPACE;
+        }
         int overlap = 0;
         for (int i=0; i<LIMIT; ++i) {
             Block b = blocks[i];
@@ -503,6 +654,9 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     }
     blocks[slot] = (Block){start, size, type, 1}; *out = (int64_t)start;
     ++allocations; live_bytes += size;
+#ifdef __SWITCH__
+    memset(backing_base + start, 0, (size_t)size);
+#endif
     write_unlock();
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
     return 0;
@@ -591,6 +745,9 @@ static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int fl
     if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return NO_MEMORY;
     uint64_t phys=flex_alloc(size);
     if (phys==UINT64_MAX) return NO_MEMORY;
+#ifdef __SWITCH__
+    if (flex_base) memset(flex_base + (phys - POOL_SIZE), 0, (size_t)size);
+#endif
     int32_t result=place(inout,size,prot,flags,PAGE,KIND_FLEXIBLE,0,phys);
     if (result) flex_free(phys,size); else ++flexible_maps;
     return result;
@@ -787,6 +944,29 @@ static void pool_give_locked(uint64_t phys, uint64_t size) {
 static ABI int32_t pool_commit(void *address, uint64_t size, int type, int prot, int flags) {
     (void)flags;
     if (!address || (uintptr_t)address%PAGE || !size || size%PAGE) return INVALID;
+#ifdef __SWITCH__
+    /* The reservation already owns real memory at this address; the pool pages only back aliases. */
+    for (uint64_t done=0; done<size;) {
+        uint64_t phys, pages;
+        write_lock();
+        if (!pool_take_locked((size-done)/PAGE,&phys,&pages)) { write_unlock(); return NO_MEMORY; }
+        const uintptr_t at=(uintptr_t)address+done;
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || at+pages*PAGE>vmas[i].end) {
+            pool_give_locked(phys,pages*PAGE);
+            write_unlock();
+            return INVALID;
+        }
+        memset((void *)at,0,(size_t)(pages*PAGE)); /* committed pages read as zero */
+        vmas[i].kind=KIND_DIRECT; vmas[i].phys=phys; vmas[i].prot=prot; vmas[i].type=type;
+        vmas[i].owned_data=1;
+        queue_hook(HOOK_MAP,at,pages*PAGE);
+        write_unlock();
+        flush_hooks();
+        done+=pages*PAGE;
+    }
+    return 0;
+#else
     /* One physical run per step; GPU notifications drain between steps (bounded queue). */
     for (uint64_t done=0; done<size;) {
         uint64_t phys, pages;
@@ -801,11 +981,32 @@ static ABI int32_t pool_commit(void *address, uint64_t size, int type, int prot,
         done+=pages*PAGE;
     }
     return 0;
+#endif
 }
 static ABI int32_t pool_decommit(void *address, uint64_t size, int flags) {
     (void)flags;
     uintptr_t start=(uintptr_t)address, end=start+size;
     if (start%PAGE || !size || size%PAGE) return INVALID;
+#ifdef __SWITCH__
+    /* Keep the reservation's memory: a later commit maps it again in place. */
+    for (uintptr_t at=start; at<end;) {
+        write_lock();
+        size_t i=vma_index(at);
+        while (i<vma_count && vmas[i].end<=at) ++i;
+        if (i>=vma_count || vmas[i].start>=end) { write_unlock(); break; }
+        uintptr_t a=vmas[i].start>at ? vmas[i].start : at, b=vmas[i].end<end ? vmas[i].end : end;
+        if (vmas[i].kind!=KIND_RESERVED) {
+            if (vmas[i].kind==KIND_DIRECT && !vmas[i].owned_data)
+                pool_give_locked(vmas[i].phys+(a-vmas[i].start),b-a);
+            queue_hook(HOOK_UNMAP,a,b-a);
+            vmas[i].kind=KIND_RESERVED; vmas[i].prot=0;
+        }
+        write_unlock();
+        flush_hooks();
+        at=b;
+    }
+    return 0;
+#else
     /* One mapped region per step, returned to the pool and left reserved. */
     for (uintptr_t at=start; at<end;) {
         write_lock();
@@ -826,6 +1027,7 @@ static ABI int32_t pool_decommit(void *address, uint64_t size, int flags) {
         at=b;
     }
     return 0;
+#endif
 }
 /* Names a range for the debugger only. */
 static ABI int32_t set_virtual_range_name(void *address,uint64_t size,const char *name) {
@@ -859,7 +1061,9 @@ uintptr_t runtime_memory_resolve(const char *name) {
 /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
  * [LOW_MIN, USER_MIN): PS4 code packs pointers into 40-bit fields. */
 #define LOW_MIN UINT64_C(0x0800000000)
+#if !defined(__SWITCH__)
 static uintptr_t low_next=LOW_MIN;
+#endif
 void *runtime_low_map(size_t size, int prot) {
     size=align_up(size,PAGE);
     write_lock();
@@ -869,6 +1073,12 @@ void *runtime_low_map(size_t size, int prot) {
         p=VirtualAlloc((void *)low_next,size,MEM_RESERVE|MEM_COMMIT,win_prot(prot));
         low_next+=size+UINT64_C(65536); /* unmapped gap catches overruns; allocation granularity */
     }
+    write_unlock();
+    return p;
+#elif defined(__SWITCH__)
+    (void)prot;
+    void *p = memalign(PAGE, (size_t)size);
+    if (p) memset(p, 0, (size_t)size);
     write_unlock();
     return p;
 #else
@@ -883,7 +1093,7 @@ void *runtime_low_map(size_t size, int prot) {
     return p==MAP_FAILED ? NULL : p;
 #endif
 }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)
 /* Thread and fiber stacks are never unmapped, which would give the address back to nothing but this allocator;
  * released ones wait here by size, with their pages returned to the kernel. */
 typedef struct IdleStack { size_t size; struct IdleStack *next; } IdleStack;
@@ -918,6 +1128,16 @@ void runtime_stack_release(void *stack,size_t size) {
     pthread_mutex_unlock(&stacks_lock);
 }
 #endif
+#ifdef __SWITCH__
+void *runtime_stack_acquire(size_t size) {
+    size = align_up(size, PAGE);
+    return memalign(PAGE, size);
+}
+void runtime_stack_release(void *stack, size_t size) {
+    (void)size;
+    free(stack);
+}
+#endif
 /* ---- GPU library interface (the video core registers its page hooks here) ---- */
 /* Video core optimizations switched off for diagnostics (gpu/shim/dcp_toggles.h); 0: all on. */
 uint64_t runtime_disabled_optimizations;
@@ -934,6 +1154,13 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
+#ifdef __SWITCH__
+    /* Guest addresses are the memory: there is no second view to write through. */
+    const int ok=covered(address,address+size,0);
+    if (ok) memcpy((void *)address,data,(size_t)size);
+    read_unlock();
+    return ok;
+#else
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
@@ -944,6 +1171,7 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     }
     read_unlock();
     return ok;
+#endif
 }
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */

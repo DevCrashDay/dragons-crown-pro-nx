@@ -1,6 +1,11 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#ifdef __SWITCH__
+#include <switch.h>
+#include "nx/x64_exec.h"
+#include "nx/nx_platform.h"
+#endif
 #include "startup_phase.h"
 #include "runtime_online.h"
 #include "dcpgpu.h"
@@ -56,11 +61,16 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
 
 void runtime_start(uint64_t flags) {
     capabilities = flags;
+#ifdef __SWITCH__
+    nx_platform_trace("Runtime: start flags=%llu\n", (unsigned long long)flags);
+#endif
     if (!(flags & 1)) return;
 #ifdef _WIN32
     unsigned int halves[2];
     if (rand_s(&halves[0]) || rand_s(&halves[1])) { fputs("Cannot initialize stack canary\n", stderr); exit(1); }
     memcpy(&stack_canary, halves, sizeof(stack_canary));
+#elif defined(__SWITCH__)
+    randomGet(&stack_canary, sizeof(stack_canary));
 #else
     FILE *random = fopen("/dev/urandom", "rb");
     if (!random || fread(&stack_canary, sizeof(stack_canary), 1, random) != 1) {
@@ -69,6 +79,9 @@ void runtime_start(uint64_t flags) {
     fclose(random);
 #endif
     stack_canary &= ~UINT64_C(255);
+#ifdef __SWITCH__
+    nx_platform_trace("Runtime: stack canary ready\n");
+#endif
 }
 void runtime_report(void) {
     printf("Runtime: _init_env=%zu, atexit=%zu, __cxa_atexit=%zu, registered handlers=%zu\n",
@@ -125,8 +138,13 @@ void runtime_finalize(void *dso) {
         if (!i) { pthread_mutex_unlock(&handler_lock); return; }
         ExitHandler handler = handlers[i-1]; handlers[i-1].active = 0;
         pthread_mutex_unlock(&handler_lock);
+#ifdef __SWITCH__
+        if (handler.with_arg) NX_GUEST_CALL(handler.callback.with_arg,handler.argument,0,0,0);
+        else NX_GUEST_CALL(handler.callback.plain,0,0,0,0);
+#else
         if (handler.with_arg) handler.callback.with_arg(handler.argument);
         else handler.callback.plain();
+#endif
     }
 }
 static ABI void guest_finalize(void *dso) { runtime_finalize(dso); }

@@ -1,4 +1,7 @@
 #include "guest_hook.h"
+#ifdef __SWITCH__
+#include "nx/x64_exec.h"
+#endif
 
 #include <string.h>
 
@@ -134,7 +137,12 @@ GuestHookStatus guest_hooks_install(uint8_t *image, uint64_t size, uint64_t entr
         const GuestHook *hook = &hooks[i];
         uint8_t *stub = stubs + i * stride;
         uint8_t *at = stub;
+#ifdef __SWITCH__
+        /* The stub is guest x86 code: reach the AArch64 handler through a Box64 bridge. */
+        const uint64_t handler = nx_x64_bridge((void *)hook->handler);
+#else
         const uint64_t handler = (uint64_t)(uintptr_t)hook->handler;
+#endif
         const uint64_t resume = (uint64_t)(uintptr_t)(image + hook->offset + hook->length);
         at = emit(at, stub_save, sizeof(stub_save));
         at = emit(at, &handler, 8);

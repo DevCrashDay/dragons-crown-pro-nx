@@ -168,7 +168,11 @@ IsaHostFeatures isa_host_features(void) {
         host.leaf1_ecx = c;
         /* AVX counts only when the OS saves the YMM state (OSXSAVE and XCR0 bits 1-2). */
         unsigned xcr0 = 0, high = 0;
+#if defined(__x86_64__) || defined(_M_X64)
         if (c & bit_OSXSAVE) __asm__ volatile("xgetbv" : "=a"(xcr0), "=d"(high) : "c"(0));
+#else
+        (void)high;
+#endif
         if ((xcr0 & 6) != 6) host.leaf1_ecx &= ~(uint32_t)bit_AVX;
     }
     if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) host.leaf7_ebx = b;

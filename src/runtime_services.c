@@ -21,6 +21,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -119,6 +120,8 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 3: *value=1; break;                    /* 24-hour clock */
 #ifdef _WIN32
     case 4: *value=(int32_t)(compat_utc_offset(time(NULL))/60); break;
+#elif defined(__SWITCH__)
+    case 4: *value=0; break;
 #else
     case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60); break; }
 #endif

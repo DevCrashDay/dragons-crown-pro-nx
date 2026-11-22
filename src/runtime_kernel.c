@@ -3,6 +3,9 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#ifdef __SWITCH__
+#include "nx/x64_exec.h"
+#endif
 #include "startup_phase.h"
 #include "runtime_log.h"
 #include <stdio.h>
@@ -46,6 +49,17 @@ static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); retu
 /* ---- clocks and sleeping ---- */
 static struct timespec process_start;
 __attribute__((constructor)) static void remember_start(void) { clock_gettime(CLOCK_MONOTONIC,&process_start); }
+#ifdef __SWITCH__
+#ifndef CLOCK_THREAD_CPUTIME_ID
+#define CLOCK_THREAD_CPUTIME_ID CLOCK_MONOTONIC
+#endif
+#ifndef CLOCK_PROCESS_CPUTIME_ID
+#define CLOCK_PROCESS_CPUTIME_ID CLOCK_MONOTONIC
+#endif
+#ifndef CLOCK_REALTIME_COARSE
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#endif
 static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
     case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
@@ -135,6 +149,9 @@ static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
     time_t now=time(NULL);
 #ifdef _WIN32
     tz->minuteswest=(int32_t)(-compat_utc_offset(now)/60); tz->dsttime=0;
+#elif defined(__SWITCH__)
+    (void)now;
+    tz->minuteswest=0; tz->dsttime=0;
 #else
     struct tm local; localtime_r(&now,&local);
     tz->minuteswest=(int32_t)(-local.tm_gmtoff/60); tz->dsttime=0;
@@ -319,7 +336,11 @@ void runtime_thread_keys_cleanup(void) {
             void *value=key_values[i];
             if (!value || !keys[i].used || !keys[i].destructor) continue;
             key_values[i]=NULL; any=1;
+#ifdef __SWITCH__
+            NX_GUEST_CALL(keys[i].destructor,value,0,0,0);
+#else
             keys[i].destructor(value);
+#endif
         }
         if (!any) break;
     }

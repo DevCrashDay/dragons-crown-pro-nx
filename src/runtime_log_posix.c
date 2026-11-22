@@ -103,6 +103,22 @@ int runtime_log_start(const char *dir, const char *file, char *path, size_t size
     if (!runtime_log_create(dir, file, path, size, &created)) return 0;
     runtime_log_set_session_path(path);
     log_fd = (int)(intptr_t)created;
+#ifdef __SWITCH__
+    extern int nx_platform_has_nxlink(void);
+    fflush(NULL);
+    if (!nx_platform_has_nxlink()) {
+        dup2(log_fd, 1);
+        dup2(log_fd, 2);
+        close(log_fd);
+        log_fd = -1;
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+    } else {
+        close(log_fd);
+        log_fd = -1;
+    }
+    return 1;
+#else
     int pipes[2];
     if (pipe2(pipes, O_CLOEXEC)) {
         close(log_fd);
@@ -129,6 +145,7 @@ int runtime_log_start(const char *dir, const char *file, char *path, size_t size
     }
     if (saved_error >= 0) close(saved_error);
     return redirected;
+#endif
 }
 
 void runtime_log_release(void) {}
