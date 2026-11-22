@@ -1,0 +1,261 @@
+Box64 Switch patch. Apply on upstream box64 commit 3e5a0b5988435843a9a28534c08e97a2d34ed698
+(git -C third_party/box64 apply --ignore-whitespace ../../patches/box64-switch.patch)
+
+diff --git a/src/custommem.c b/src/custommem.c
+index 717a0d7..163e7e7 100644
+--- a/src/custommem.c
++++ b/src/custommem.c
+@@ -1709,6 +1709,13 @@ dynablock_t* FindDynablockFromNativeAddress(void* p)
+ #ifdef TRACE_MEMSTAT
+ static uint64_t dynarec_allocated = 0;
+ #endif
++#ifdef __SWITCH__
++extern void* nx_jit_rw(void* p);
++extern void* nx_jit_rx(void* p);
++#else
++static inline void* nx_jit_rw(void* p) { return p; }
++static inline void* nx_jit_rx(void* p) { return p; }
++#endif
+ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
+ {
+     if(!size)
+@@ -1735,7 +1742,7 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
+                 if(rsize==list->chunks[i]->maxfree)
+                     list->chunks[i]->maxfree = getMaxFreeBlock(list->chunks[i]->block, list->chunks[i]->size, list->chunks[i]->first);
+                 //rb_set_64(list->chunks[i].tree, (uintptr_t)ret, (uintptr_t)ret+size, (uintptr_t)ret);
+-                return (uintptr_t)ret;
++                return (uintptr_t)nx_jit_rx(ret);
+             }
+         }
+     }
+@@ -1776,6 +1783,7 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
+         dynarec_log(LOG_INFO, "Cannot create dynamic map of %zu bytes (%s)\n", allocsize, strerror(errno));
+         return 0;
+     }
++    p = nx_jit_rw(p);
+     #ifdef MADV_HUGEPAGE
+     madvise(p, allocsize, MADV_HUGEPAGE);
+     #endif
+@@ -1813,13 +1821,14 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
+     if(list->chunks[i]->maxfree)
+         list->chunks[i]->first = getNextFreeBlock(m);
+     //rb_set_64(list->chunks[i].tree, (uintptr_t)ret, (uintptr_t)ret+size, (uintptr_t)ret);
+-    return (uintptr_t)ret;
++    return (uintptr_t)nx_jit_rx(ret);
+ }
+ 
+ void FreeDynarecMap(uintptr_t addr)
+ {
+     if(!addr)
+         return;
++    addr = (uintptr_t)nx_jit_rw((void*)addr);
+ 
+ 
+     blocklist_t* bl = (blocklist_t*)rb_get_64(rbt_dynmem, addr);
+diff --git a/src/dynarec/arm64/arm64_emitter.h b/src/dynarec/arm64/arm64_emitter.h
+index 790b42e..ea0a6e3 100644
+--- a/src/dynarec/arm64/arm64_emitter.h
++++ b/src/dynarec/arm64/arm64_emitter.h
+@@ -753,7 +753,12 @@ int convert_bitmask(uint64_t bitmask);
+ #define MRS_fpsr(Rt)                    EMIT(MRS_gen(1, 1, 3, 4, 4, 1, Rt))
+ #define MSR_fpsr(Rt)                    EMIT(MRS_gen(0, 1, 3, 4, 4, 1, Rt))
+ // mrs   x0, cntvct_el0     op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b010
++// mrs   x0, cntpct_el0     op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b001 (Horizon EL0-readable)
++#ifdef __SWITCH__
++#define MRS_cntvct_el0(Rt)              EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b001, Rt))
++#else
+ #define MRS_cntvct_el0(Rt)              EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b010, Rt))
++#endif
+ // mrs   x0, cntpctss_el0   op0=0b11 op1=0b011 CRn=0b1110 CRm=0b0000 op2=0b101
+ #define MRS_cntpctss_el0(Rt)            EMIT(MRS_gen(1, 1, 0b011, 0b1110, 0b0000, 0b101, Rt))
+ // mrs   rt, rndr           op0=0b11 op1=0b011 CRn=0b0010 CRm=0b0100 op2=0b000
+diff --git a/src/dynarec/arm64/dynarec_arm64_jmpnext.c b/src/dynarec/arm64/dynarec_arm64_jmpnext.c
+index d3482d3..a5bb62b 100644
+--- a/src/dynarec/arm64/dynarec_arm64_jmpnext.c
++++ b/src/dynarec/arm64/dynarec_arm64_jmpnext.c
+@@ -8,9 +8,14 @@
+         *block = (A); \
+         ++block;      \
+     } while (0)
++#ifdef __SWITCH__
++extern void* nx_jit_rw(void* p);
++#else
++static inline void* nx_jit_rw(void* p) { return p; }
++#endif
+ void CreateJmpNext(void* addr, void* next)
+ {
+-    uint32_t* block = (uint32_t*)addr;
++    uint32_t* block = (uint32_t*)nx_jit_rw(addr);
+     LDRx_literal(x2, (intptr_t)next - (intptr_t)addr);
+     BR(x2);
+ }
+diff --git a/src/dynarec/arm64/updateflags_arm64.c b/src/dynarec/arm64/updateflags_arm64.c
+index bef439c..c43fe38 100644
+--- a/src/dynarec/arm64/updateflags_arm64.c
++++ b/src/dynarec/arm64/updateflags_arm64.c
+@@ -68,11 +68,23 @@ void* create_updateflags()
+     void* instsize = next + 4*sizeof(void*);
+     void* arch = instsize + 0;
+     void* callrets = arch + 0;
++#ifdef __SWITCH__
++extern void* nx_jit_rw(void* p);
++#else
++static inline void* nx_jit_rw(void* p) { return p; }
++#endif
+     if(actual_p==NULL) {
+         dynarec_log(LOG_INFO, "AllocDynarecMap(%zu) failed, canceling UpdateBlock\n", sz);
+         return NULL;
+     }
+-    helper.block = p;
++    void* rw_actual_p = nx_jit_rw(actual_p);
++    void* rw_p = (void*)(((uintptr_t)rw_actual_p) + sizeof(void*));
++    void* rw_tablestart = rw_p + native_size;
++    void* rw_next = rw_tablestart + helper.table64size*sizeof(uint64_t);
++    instsize = rw_next + 4*sizeof(void*);
++    arch = instsize + 0;
++    callrets = arch + 0;
++    helper.block = rw_p;
+     dynablock_t* block = (dynablock_t*)(callrets+0);
+     memset(block, 0, sizeof(dynablock_t));
+     void* relocs = helper.need_reloc?(block+1):NULL;
+@@ -83,11 +95,11 @@ void* create_updateflags()
+     helper.relocs = relocs;
+     block->relocs = relocs;
+     block->table64size = helper.table64size;
+-    helper.native_start = (uintptr_t)p;
+-    helper.tablestart = (uintptr_t)tablestart;
+-    helper.jmp_next = (uintptr_t)next+sizeof(void*);
++    helper.native_start = (uintptr_t)rw_p;
++    helper.tablestart = (uintptr_t)rw_tablestart;
++    helper.jmp_next = (uintptr_t)rw_next+sizeof(void*);
+     helper.instsize = (instsize_t*)instsize;
+-    *(dynablock_t**)actual_p = block;
++    *(dynablock_t**)rw_actual_p = block;
+     helper.table64cap = helper.table64size;
+     helper.table64 = (uint64_t*)helper.tablestart;
+     helper.callrets = (callret_t*)callrets;
+diff --git a/src/dynarec/dynarec_native.c b/src/dynarec/dynarec_native.c
+index d9a51ef..4948820 100644
+--- a/src/dynarec/dynarec_native.c
++++ b/src/dynarec/dynarec_native.c
+@@ -353,9 +353,19 @@ static int static_preds[MAX_INSTS*2+2]; // for the worst case scenario were all
+ void* redundant_helper = NULL;
+ // TODO: ninst could be a uint16_t instead of an int, that could same some temp. memory
+ 
++#ifdef __SWITCH__
++extern void* nx_jit_rw(void* p);
++extern void nx_jit_flush(void* rx_start, size_t len);
++#else
++static inline void* nx_jit_rw(void* p) { return p; }
++#endif
++
+ void ClearCache(void* start, size_t len)
+ {
+-#if defined(ARM64)
++#ifdef __SWITCH__
++    nx_jit_flush(start, len);
++    return;
++#elif defined(ARM64)
+     // manually clear cache, I have issue with regular function on Ampere with kernel 6.12.4
+     uintptr_t xstart = (uintptr_t)start;
+     uintptr_t xend = (uintptr_t)start + len + 1;
+@@ -518,7 +528,9 @@ dynablock_t* CreateEmptyBlock(uintptr_t addr, int is32bits, int is_new) {
+         CancelBlock64(0);
+         return NULL;
+     }
+-    dynablock_t* block = (dynablock_t*)(actual_p+JMPNEXT_SIZE);
++    void* rw_actual_p = nx_jit_rw(actual_p);
++    void* rw_p = rw_actual_p + sizeof(void*);
++    dynablock_t* block = (dynablock_t*)(rw_actual_p+JMPNEXT_SIZE);
+     memset(block, 0, sizeof(dynablock_t));
+     // fill the block
+     block->x64_addr = (void*)addr;
+@@ -530,8 +542,8 @@ dynablock_t* CreateEmptyBlock(uintptr_t addr, int is32bits, int is_new) {
+     block->block = p;
+     block->jmpnext = p;
+     block->is32bits = is32bits;
+-    *(dynablock_t**)actual_p = block;
+-    *(void**)(p+JMPNEXT_SIZE-2*sizeof(void*)) = native_epilog;
++    *(dynablock_t**)rw_actual_p = block;
++    *(void**)(rw_p+JMPNEXT_SIZE-2*sizeof(void*)) = native_epilog;
+     CreateJmpNext(block->jmpnext, p+JMPNEXT_SIZE-2*sizeof(void*));
+     // all done...
+     ClearCache(actual_p+sizeof(void*), JMPNEXT_SIZE-sizeof(void*));   // need to clear the cache before execution...
+@@ -897,13 +909,17 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
+                 state = BUILD_ABORT_NULL;
+                 continue;
+             }
++            void* rw_actual_p = nx_jit_rw(actual_p);
+             p = (void*)(((uintptr_t)actual_p) + sizeof(void*));
++            void* rw_p = (void*)(((uintptr_t)rw_actual_p) + sizeof(void*));
+             tablestart = p + native_size;
+             next = tablestart + helper.table64size*sizeof(uint64_t);
+-            instsize = next + JMPNEXT_SIZE;
++            void* rw_tablestart = rw_p + native_size;
++            void* rw_next = rw_tablestart + helper.table64size*sizeof(uint64_t);
++            instsize = rw_next + JMPNEXT_SIZE;
+             arch = instsize + insts_rsize;
+             callrets = arch + arch_size;
+-            helper.block = p;
++            helper.block = rw_p;
+             block = (dynablock_t*)(callrets+callret_size+dynablock_align);
+             memset(block, 0, sizeof(dynablock_t));
+             void* relocs = helper.need_reloc?(block+1):NULL;
+@@ -915,11 +931,11 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
+             helper.relocs = relocs;
+             block->relocs = relocs;
+             block->table64size = helper.table64size;
+-            helper.native_start = (uintptr_t)p;
+-            helper.tablestart = (uintptr_t)tablestart;
+-            helper.jmp_next = (uintptr_t)next+sizeof(void*);
++            helper.native_start = (uintptr_t)rw_p;
++            helper.tablestart = (uintptr_t)rw_tablestart;
++            helper.jmp_next = (uintptr_t)rw_next+sizeof(void*);
+             helper.instsize = (instsize_t*)instsize;
+-            *(dynablock_t**)actual_p = block;
++            *(dynablock_t**)rw_actual_p = block;
+             helper.table64cap = helper.table64size;
+             helper.table64 = (uint64_t*)helper.tablestart;
+             helper.callrets = (callret_t*)callrets;
+@@ -994,8 +1010,8 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
+             block->callret_size = helper.callret_size;
+             block->callrets = helper.callrets;
+             block->native_size = native_size;
+-            *(dynablock_t**)next = block;
+-            *(void**)(next+JMPNEXT_SIZE-sizeof(void*)) = native_next;
++            *(dynablock_t**)nx_jit_rw(next) = block;
++            *(void**)nx_jit_rw(next+JMPNEXT_SIZE-sizeof(void*)) = native_next;
+             CreateJmpNext(block->jmpnext, next+JMPNEXT_SIZE-sizeof(void*));
+             ClearCache(block->jmpnext, JMPNEXT_SIZE-sizeof(void*));
+             //block->x64_addr = (void*)start;
+diff --git a/src/include/os.h b/src/include/os.h
+index 620e8e7..9660821 100644
+--- a/src/include/os.h
++++ b/src/include/os.h
+@@ -78,7 +78,13 @@ const char* GetNativeName(void* p, int lib);
+ const char* GetBridgeName(void* p);
+ // ----------------------------------------------------------------
+ 
+-#ifndef _WIN32
++#if defined(__SWITCH__)
++// newlib: no sigsetjmp / struct __jmp_buf_tag, and no signal mask to save
++#include <setjmp.h>
++// a is a pointer to jmp_buf, as with struct __jmp_buf_tag* on Linux
++#define LongJmp(a, b) longjmp(*(a), b)
++#define SigSetJmp(a, b) setjmp(*(a))
++#elif !defined(_WIN32)
+ #include <setjmp.h>
+ #define LongJmp longjmp
+ #define SigSetJmp sigsetjmp
+@@ -97,7 +103,10 @@ void Box64EC_LongJmp(void* buf) __attribute__((noreturn));
+ #include <setjmp.h>
+ #define NEW_JUMPBUFF(name) \
+     static __thread JUMPBUFF name
+-#ifdef ANDROID
++#if defined(__SWITCH__)
++#define JUMPBUFF jmp_buf
++#define GET_JUMPBUFF(name) &name
++#elif defined(ANDROID)
+ #define JUMPBUFF sigjmp_buf
+ #define GET_JUMPBUFF(name) name
+ #else

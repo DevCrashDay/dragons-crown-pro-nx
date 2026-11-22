@@ -2,18 +2,23 @@ cmake_minimum_required(VERSION 3.24)
 project(dragons_crown_pro_pc VERSION 1.4.0 LANGUAGES C CXX)
 set(DCP_PORT_VERSION "${PROJECT_VERSION}")
 
-if (NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+set(DCP_SWITCH OFF)
+if (NINTENDO_SWITCH OR CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" OR CMAKE_C_COMPILER MATCHES "aarch64-none-elf")
+    set(DCP_SWITCH ON)
+endif()
+
+if (NOT DCP_SWITCH AND NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "Build with Clang: MSYS2 CLANG64 (tools\\build.ps1) on Windows, tools/build.sh on Linux.")
 endif()
-if (NOT WIN32 AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$"))
-    message(FATAL_ERROR "Supported targets: Windows x64 and Linux x86_64.")
+if (NOT WIN32 AND NOT DCP_SWITCH AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$"))
+    message(FATAL_ERROR "Supported targets: Windows x64, Linux x86_64, and Nintendo Switch.")
 endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 if (WIN32)
     set(CMAKE_C_EXTENSIONS OFF)
 else()
-    set(CMAKE_C_EXTENSIONS ON) # POSIX interfaces (sigjmp_buf, memfd_create) are hidden in strict ISO mode
+    set(CMAKE_C_EXTENSIONS ON) # POSIX interfaces (sigjmp_buf, memfd_create) and newlib/libnx extensions
 endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if (NOT CMAKE_BUILD_TYPE)
@@ -21,11 +26,15 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 # Repository paths in __FILE__ and std::source_location stay out of the binary; debug info keeps them.
 add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=>")
-if (NOT WIN32)
+if (NOT WIN32 AND NOT DCP_SWITCH)
     # Non-PIE: the heap handed to the guest (thread handles, TLS) must stay below 1 TiB (loader.c).
     set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fno-pie>")
     add_link_options(-no-pie)
+endif()
+if (DCP_SWITCH)
+    # .nro is PIE: every object (incl. FetchContent deps) must be PIC or ld rejects text relocations.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
 if (NOT PROJECT_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
@@ -35,16 +44,39 @@ file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/generated/dcp_version.h CONTENT "#defi
 ${CMAKE_MATCH_1},${CMAKE_MATCH_2},${CMAKE_MATCH_3},0\n#define DCP_FILE_VERSION_STRING \
 \"${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}.0\"\n#define DCP_VERSION_STRING \"${PROJECT_VERSION}\"\n")
 
-find_package(SDL3 CONFIG REQUIRED)
-find_package(Freetype REQUIRED)
-find_package(Threads REQUIRED)
+if (DCP_SWITCH)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+    add_library(DCP_SDL ALIAS PkgConfig::SDL2)
+    pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
+    # IMPORTED_TARGET resolves -lstdc++/-lm/-lpthread to the non-PIC aarch64-none-elf/lib copies,
+    # bypassing the driver's pic multilib -> "read-only segment has dynamic relocations".
+    # Link by the raw pkg-config flags so g++ picks lib/pic itself.
+    function(dcp_pkg_link_by_name prefix)
+        set_property(TARGET PkgConfig::${prefix} PROPERTY INTERFACE_LINK_LIBRARIES "${${prefix}_LDFLAGS}")
+    endfunction()
+    dcp_pkg_link_by_name(SDL2)
+    dcp_pkg_link_by_name(FREETYPE)
+    enable_language(ASM)
+    include(src/nx/box64nx.cmake)
+else()
+    find_package(SDL3 CONFIG REQUIRED)
+    add_library(DCP_SDL ALIAS SDL3::SDL3)
+    find_package(Freetype REQUIRED)
+    find_package(Threads REQUIRED)
+endif()
 
 # Keyboard and mouse bindings and the mouse and touch input state shared by the launcher, the runtime pad and the video core.
 add_library(dcp_keys STATIC src/dcp_keys.c src/dcp_mouse.c src/dcp_touchscreen.c src/dcp_pointer_motion.c src/dcp_pad_owner.c)
-target_include_directories(dcp_keys PUBLIC src)
-target_link_libraries(dcp_keys PUBLIC SDL3::SDL3)
+target_include_directories(dcp_keys PUBLIC src $<$<BOOL:${DCP_SWITCH}>:${CMAKE_SOURCE_DIR}/src/nx/sdl3_shim>)
+if (DCP_SWITCH)
+    target_link_libraries(dcp_keys PUBLIC PkgConfig::SDL2)
+else()
+    target_link_libraries(dcp_keys PUBLIC SDL3::SDL3)
+endif()
 target_compile_options(dcp_keys PRIVATE -Wall -Wextra -Werror)
 
+if (NOT DCP_SWITCH)
 # Online play (docs/ONLINE.md): lobby link, identity, STUN, UPnP and the direct peer transport. No game code: the
 # launcher, the runtime and tests/net_tests.cpp share it.
 add_library(dcp_net STATIC src/net/addr.cpp src/net/connection_test.cpp src/net/crypto.cpp src/net/identity.cpp
@@ -62,6 +94,7 @@ else()
     find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
     target_link_libraries(dcp_net PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 endif()
+endif()
 
 # The stage the process is in, for the crash report: used by the launcher, the loader and the window thread.
 add_library(dcp_startup_phase STATIC src/startup_phase.c)
@@ -74,7 +107,9 @@ target_include_directories(dcp_ui_text PUBLIC launcher src)
 set_target_properties(dcp_ui_text PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 
 add_subdirectory(gpu)
-add_subdirectory(launcher)
+if (NOT DCP_SWITCH)
+    add_subdirectory(launcher)
+endif()
 
 set(DCP_RUNTIME_SOURCES
     src/boss_battle.c
@@ -145,6 +180,43 @@ if (WIN32)
     set_source_files_properties(src/dragons_crown_pro.rc PROPERTIES OBJECT_DEPENDS
         "${CMAKE_SOURCE_DIR}/packaging/icons/app-icon.ico;${CMAKE_SOURCE_DIR}/src/dragons_crown_pro.manifest;${CMAKE_BINARY_DIR}/generated/dcp_version.h")
     set(DCP_PLATFORM_SOURCES src/compat_win.c src/module_diagnostics.c src/module_history.c src/call_site.c src/runtime_log.c src/dragons_crown_pro.rc)
+elseif (DCP_SWITCH)
+    set(DCP_PLATFORM_SOURCES
+        src/runtime_log_posix.c
+        src/runtime_session_log.c
+        src/nx/nx_platform.c
+        src/nx/nx_gpu_probe.c
+        src/nx/nx_x64_selftest.c
+        src/nx/nx_posix_stubs.c
+        src/nx/nx_net_stubs.cpp
+        src/latin_glyphs.c
+        src/cyrillic_glyphs.c
+        src/trophies/trophy_data.cpp
+        src/trophies/trophy_key.cpp
+        src/trophies/trophy_pack.cpp
+        src/trophies/trophy_runtime.cpp
+        src/trophies/trophy_service.cpp
+        src/trophies/trophy_store.cpp
+        src/trophies/trophy_view.cpp
+        src/trophies/trp_archive.cpp
+        launcher/build_scan.cpp
+        launcher/build_scan_sites.cpp
+        launcher/controller_prompts.cpp
+        launcher/cpk_patch.cpp
+        launcher/cyrillic_font.cpp
+        launcher/feature_sites.cpp
+        launcher/game_files.cpp
+        launcher/game_profile.cpp
+        launcher/latin_font.cpp
+        launcher/npc_voice_resources.cpp
+        launcher/online_settings.cpp
+        launcher/online_view.cpp
+        launcher/paths.cpp
+        launcher/resolution.c
+        launcher/resolution_probe.c
+        launcher/settings.cpp
+        launcher/text_languages.cpp
+        third_party/trg-launcher/src/settings.cpp)
 else()
     set(DCP_PLATFORM_SOURCES src/runtime_log_posix.c)
 endif()
@@ -169,12 +241,29 @@ if (WIN32)
     # The guest main thread runs on the process stack: 16 MiB, committed (guest code has no stack probes).
     target_link_options(dragons_crown_pro PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
     target_link_libraries(dragons_crown_pro PRIVATE dcp_launcher dcpgpu SDL3::SDL3 Freetype::Freetype onecore bcrypt ws2_32 -pthread)
+elseif (DCP_SWITCH)
+    set_target_properties(dragons_crown_pro PROPERTIES CXX_EXTENSIONS ON)
+    target_include_directories(dragons_crown_pro PRIVATE src/nx src/nx/sdl3_shim src/nx/compat_headers third_party/trg-launcher/include)
+    target_compile_options(dragons_crown_pro PRIVATE -Wno-attributes -Wno-enum-compare -Wno-unused-but-set-variable -Wno-unused-function -Wno-format-truncation)
+    target_link_directories(dragons_crown_pro PRIVATE "$ENV{DEVKITPRO}/libnx/lib" "$ENV{DEVKITPRO}/portlibs/switch/lib")
+    target_link_options(dragons_crown_pro PRIVATE "-specs=$ENV{DEVKITPRO}/libnx/switch.specs")
+    target_link_libraries(dragons_crown_pro PRIVATE dcpgpu box64nx PkgConfig::SDL2 PkgConfig::FREETYPE m)
+    if (NOT COMMAND nx_generate_nacp)
+        include("$ENV{DEVKITPRO}/cmake/Switch.cmake")
+        include("$ENV{DEVKITPRO}/cmake/Platform/NintendoSwitch.cmake")
+    endif()
+    nx_generate_nacp(OUTPUT ${CMAKE_BINARY_DIR}/dragons_crown_pro.nacp
+        NAME "Dragon's Crown Pro"
+        AUTHOR "dragons-crown-pro-nx"
+        VERSION "${PROJECT_VERSION}")
+    nx_create_nro(dragons_crown_pro NACP ${CMAKE_BINARY_DIR}/dragons_crown_pro.nacp)
 else()
     # -rdynamic: fault reports name host symbols (dladdr).
     target_link_options(dragons_crown_pro PRIVATE -rdynamic)
     target_link_libraries(dragons_crown_pro PRIVATE dcp_launcher dcpgpu SDL3::SDL3 Freetype::Freetype Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
 
+if (NOT DCP_SWITCH)
 # The launcher reads its images next to the executable.
 add_custom_command(TARGET dragons_crown_pro POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:dragons_crown_pro>/assets/launcher"
@@ -660,3 +749,4 @@ if (NOT WIN32)
     target_compile_definitions(dcp-sigpipe-tests PRIVATE DCP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_compile_options(dcp-sigpipe-tests PRIVATE -Wall -Wextra -Werror)
 endif()
+endif() # NOT DCP_SWITCH

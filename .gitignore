@@ -6,6 +6,7 @@
 
 # Build output, boot images (build/image) and packaged builds
 /build/
+/build-nx/
 /dist/
 /out/
 
@@ -36,6 +37,8 @@ eboot.bin
 
 # TRG Launcher, fetched by tools\build.ps1 (gpu\deps.txt)
 /third_party/trg-launcher/
+# Box64 (MIT), cloned for the Switch x86-64 dynarec: git clone --depth 1 https://github.com/ptitSeb/box64 third_party/box64
+/third_party/box64/
 
 # Video core dependencies fetched by tools\build.ps1 (gpu\deps.txt); sirit, gcn, half and fonts are vendored
 /gpu/third_party/imgui/
