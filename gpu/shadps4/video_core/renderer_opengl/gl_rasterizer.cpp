@@ -344,6 +344,33 @@ void Rasterizer::Resolve() {
     gl::BlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
+// Mesa 20.1 (Switch) dereferences NULL inside glFramebufferTexture2D when the texture's level 0
+// has no storage, instead of raising an error; a non-2D target needs FramebufferTextureLayer.
+bool Rasterizer::AttachImage(GLenum attachment, const Image& image) {
+    if (gl::GetTexLevelParameteriv) {
+        state.BindForEdit(image.target, image.handle);
+        GLint width = 0;
+        gl::GetTexLevelParameteriv(image.target, 0, GL_TEXTURE_WIDTH, &width);
+        if (width <= 0) {
+            Report(fmt::format("render target without storage skipped (target 0x{:x}, internal 0x{:x}, "
+                               "{}x{})",
+                               image.target, image.format ? image.format->internal_format : 0u,
+                               image.info.size.width, image.info.size.height));
+            return false;
+        }
+    }
+    if (image.target == GL_TEXTURE_2D) {
+        gl::FramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, image.handle, 0);
+        return true;
+    }
+    if (gl::FramebufferTextureLayer) {
+        gl::FramebufferTextureLayer(GL_FRAMEBUFFER, attachment, image.handle, 0, 0);
+        return true;
+    }
+    Report(fmt::format("render target of target 0x{:x} cannot be attached", image.target));
+    return false;
+}
+
 GLuint Rasterizer::FramebufferFor(const AttachedTargets& targets) {
     u64 key = targets.depth ? targets.depth->handle : 0;
     for (const Image* image : targets.color) {
@@ -360,9 +387,7 @@ GLuint Rasterizer::FramebufferFor(const AttachedTargets& targets) {
     std::array<GLenum, AmdGpu::NUM_COLOR_BUFFERS> draw_buffers{};
     u32 count = 0;
     for (u32 i = 0; i < targets.color.size(); ++i) {
-        if (const Image* image = targets.color[i]) {
-            gl::FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D,
-                                     image->handle, 0);
+        if (const Image* image = targets.color[i]; image && AttachImage(GL_COLOR_ATTACHMENT0 + i, *image)) {
             draw_buffers[i] = GL_COLOR_ATTACHMENT0 + i;
             cached.textures[i] = image->handle;
             count = i + 1;
@@ -377,8 +402,9 @@ GLuint Rasterizer::FramebufferFor(const AttachedTargets& targets) {
     if (const Image* depth = targets.depth) {
         const GLenum attachment = depth->info.props.has_stencil ? GL_DEPTH_STENCIL_ATTACHMENT
                                                                 : GL_DEPTH_ATTACHMENT;
-        gl::FramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, depth->handle, 0);
-        cached.textures.back() = depth->handle;
+        if (AttachImage(attachment, *depth)) {
+            cached.textures.back() = depth->handle;
+        }
     }
     if (gl::CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         Report("a framebuffer combination is incomplete; its draws may be lost");

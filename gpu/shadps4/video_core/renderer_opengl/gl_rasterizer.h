@@ -125,6 +125,7 @@ private:
     bool UniformChanged(Sent& sent, const Value& value);
     bool BindTargets(const GraphicsProgram& program, AttachedTargets& targets);
     GLuint FramebufferFor(const AttachedTargets& targets);
+    bool AttachImage(GLenum attachment, const Image& image);
     void ClearTargets(const AttachedTargets& targets);
     void BindStage(const Shader::Info& info, StageLocations& locations,
                    const Shader::Backend::GLSL::Stage& glsl);

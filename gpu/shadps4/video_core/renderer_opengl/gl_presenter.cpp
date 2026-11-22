@@ -30,6 +30,7 @@ extern "C" void nx_platform_trace(const char* format, ...);
 extern "C" void runtime_file_stats(uint64_t* out_reads, uint64_t* out_bytes);
 extern "C" int g_nx_trace_loop;
 extern "C" uint64_t g_nx_image_base;
+extern "C" void nx_platform_heap_info(uint64_t* heap_total, uint64_t* heap_free);
 #endif
 
 namespace OpenGL {
@@ -485,14 +486,16 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
                 if (fs_mgr) pending_loads = *reinterpret_cast<const volatile int32_t*>(fs_mgr + 0x78);
             }
         }
-        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) pending=%d center=(%u,%u,%u) max=%u glErr=0x%x\n",
+        uint64_t heap_total = 0, heap_free = 0;
+        nx_platform_heap_info(&heap_total, &heap_free);
+        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) pending=%d center=(%u,%u,%u) max=%u glErr=0x%x heap_free=%lluMiB\n",
                           shown_count, window_width, window_height,
                           static_cast<unsigned long long>(rasterizer->DrawsReachingGl()),
                           static_cast<unsigned long long>(rasterizer->Draws()),
                           static_cast<unsigned long long>(f_reads),
                           static_cast<unsigned long long>(f_bytes / 1024),
                           pending_loads,
-                          px[0], px[1], px[2], max_rgb, err);
+                          px[0], px[1], px[2], max_rgb, err, static_cast<unsigned long long>(heap_free >> 20));
         static bool dumped_p4 = false;
         if ((shown_count == 240 || (!dumped_p4 && pending_loads == 4)) && g_nx_image_base) {
             if (pending_loads == 4) dumped_p4 = true;

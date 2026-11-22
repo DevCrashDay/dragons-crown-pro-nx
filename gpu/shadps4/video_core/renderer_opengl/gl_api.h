@@ -120,14 +120,19 @@
 
 // Absent on a plain 3.3 context: per-target blending (OpenGL 4.0) and persistent buffers
 // (ARB_buffer_storage). Check the capability, not the pointer: a driver can return one anyway.
-// The last three are OpenGL ES core calls the desktop path never makes.
+// The DepthRangef/DrawElementsInstanced/TexStorage2D are OpenGL ES core calls the desktop path
+// never makes. FramebufferTextureLayer and GetTexLevelParameteriv (ES 3.1) guard attachments.
+using DcpGetTexLevelParameteriv = void(APIENTRY*)(GLenum, GLint, GLenum, GLint*);
+
 #define DCP_GL_OPTIONAL_FUNCTIONS(X)                                                               \
     X(PFNGLBLENDEQUATIONSEPARATEIPROC, BlendEquationSeparatei)                                     \
     X(PFNGLBLENDFUNCSEPARATEIPROC, BlendFuncSeparatei)                                             \
     X(PFNGLBUFFERSTORAGEPROC, BufferStorage)                                                       \
     X(PFNGLDEPTHRANGEFPROC, DepthRangef)                                                           \
     X(PFNGLDRAWELEMENTSINSTANCEDPROC, DrawElementsInstanced)                                       \
-    X(PFNGLTEXSTORAGE2DPROC, TexStorage2D)
+    X(PFNGLTEXSTORAGE2DPROC, TexStorage2D)                                                         \
+    X(PFNGLFRAMEBUFFERTEXTURELAYERPROC, FramebufferTextureLayer)                                   \
+    X(DcpGetTexLevelParameteriv, GetTexLevelParameteriv)
 
 namespace gl {
 
