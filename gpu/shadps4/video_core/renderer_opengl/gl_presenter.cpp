@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -473,6 +476,37 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
                 read_px(pts[i][0], pts[i][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
                 if (i == 0) std::memcpy(px, p, 4);
                 max_rgb = std::max({max_rgb, p[0], p[1], p[2]});
+            }
+        }
+        // nx.ini FRAME_DUMP=N: every N-th presented frame as a quarter-size BMP in logs/.
+        static const int dump_every = [] {
+            const char* e = std::getenv("DCP_FRAME_DUMP");
+            return e ? std::atoi(e) : 0;
+        }();
+        if (read_px && dump_every > 0 && shown_count % unsigned(dump_every) == 0) {
+            const int w = window_width / 4, h = window_height / 4, row = (w * 3 + 3) & ~3;
+            // One source row per output row: a whole-frame read needs a large staging copy.
+            std::vector<u8> line(size_t(window_width) * 4);
+            const u32 data_size = u32(row * h), file_size = 54 + data_size;
+            std::vector<u8> bmp(file_size, 0);
+            auto put32 = [&](size_t at, u32 v) { std::memcpy(&bmp[at], &v, 4); };
+            bmp[0] = 'B'; bmp[1] = 'M';
+            put32(2, file_size); put32(10, 54); put32(14, 40); put32(18, u32(w)); put32(22, u32(h));
+            bmp[26] = 1; bmp[28] = 24; put32(34, data_size);
+            // GL rows are bottom-up, like BMP rows.
+            for (int y = 0; y < h; ++y) {
+                read_px(0, y * 4, window_width, 1, GL_RGBA, GL_UNSIGNED_BYTE, line.data());
+                for (int x = 0; x < w; ++x) {
+                    const u8* s = &line[size_t(x * 4) * 4];
+                    u8* d = &bmp[54 + size_t(y) * size_t(row) + size_t(x) * 3];
+                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0];
+                }
+            }
+            char path[128];
+            std::snprintf(path, sizeof path, "sdmc:/switch/dragons_crown_pro/logs/frame_%05u.bmp", shown_count);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(bmp.data(), 1, bmp.size(), f);
+                std::fclose(f);
             }
         }
         const GLenum err = gl::GetError();

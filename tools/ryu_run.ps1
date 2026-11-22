@@ -31,7 +31,8 @@ New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 # Deploy: .nro, nx.ini (defaults + overrides), fresh bringup.log.
 Copy-Item $Nro (Join-Path $GameDir "dragons_crown_pro.nro") -Force
 $settings = [ordered]@{ NX_SAFE = "1"; AUDIO = "none" }
-foreach ($kv in $Ini) {
+# "powershell -File" passes -Ini a,b as one string: split on commas too.
+foreach ($kv in (($Ini -join ",") -split "," | Where-Object { $_ -match "=" })) {
     $k, $v = $kv -split "=", 2
     $settings[$k.Trim()] = $v.Trim()
 }
@@ -39,6 +40,7 @@ $iniText = ($settings.Keys | ForEach-Object { "$_=$($settings[$_])" }) -join "`n
 [IO.File]::WriteAllText((Join-Path $GameDir "nx.ini"), "$iniText`n")
 Copy-Item (Join-Path $GameDir "nx.ini") $RunDir
 if (Test-Path $Bringup) { Remove-Item $Bringup -Force }
+Remove-Item (Join-Path $LogDir "frame_*.bmp") -Force -ErrorAction SilentlyContinue
 $runtimeBefore = @(Get-ChildItem $LogDir -Filter "dragons_crown_pro_*.log" -ErrorAction SilentlyContinue | ForEach-Object Name)
 $ryuBefore = @(Get-ChildItem $RyuLogs -Filter "*.log" -ErrorAction SilentlyContinue | ForEach-Object Name)
 
@@ -64,6 +66,7 @@ if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; Start-Sleep -Secon
 
 # Collect.
 if (Test-Path $Bringup) { Copy-Item $Bringup $RunDir }
+Move-Item (Join-Path $LogDir "frame_*.bmp") $RunDir -Force -ErrorAction SilentlyContinue
 $rt = Get-NewRuntimeLog
 if ($rt) { Copy-Item $rt.FullName (Join-Path $RunDir "runtime.log") }
 Get-ChildItem $RyuLogs -Filter "*.log" -ErrorAction SilentlyContinue |
