@@ -416,8 +416,10 @@ static void read_inject(void) {
     if (st.st_mtime==mtime.tv_sec && st.st_size==mtime.tv_nsec) return;
     mtime=(struct timespec){st.st_mtime,(long)st.st_size};
 #else
-    if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
-    mtime=st.st_mtim;
+    /* The size too: an emulator's SD card can report the same mtime for every write. */
+    static off_t size=-1;
+    if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec && st.st_size==size) return;
+    mtime=st.st_mtim; size=st.st_size;
 #endif
     FILE *f=fopen(path,"r");
     if (!f) return;
