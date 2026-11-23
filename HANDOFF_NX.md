@@ -38,7 +38,10 @@ Last updated: 2026-11-22. Branch: `switch-port`. This is the only handoff docume
     latency (`min queued 4–8 KiB`), zero starvation after boot, survives 390 ms load hitches.
   - **Phase 5 gates passed:** `BOX64_DYNAREC_STRONGMEM=1` (now default in `src/nx/box64_os_nx.c`,
     zero measured speed penalty), split CPK (`DRACRO.CPK.000/.001`), `SoftwarePageTable` run
-    (`runs/20261122-222015-softpt-gate`, 1260 frames, `glErr=0x0(0)`), RAM margin (~390 MiB free).
+    (`runs/20261122-222015-softpt-gate`, 1260 frames, `glErr=0x0(0)`), RAM margin (~390 MiB free),
+    and **30-min soak** (`runs/20261123-082732-soak-30m`, 1800 s, 21,180 frames, 9,334,973/9,334,973
+    draws, `glErr=0x0(0)`, `heap_free=389 MiB`, `arena=610/800 MiB` with `big=56 MiB` contiguous,
+    steady `938/937 buffers/5s` `audout`, zero freezes/errors).
   - **Early exit at ~200 s explained:** `padexplore` accidentally opened the `SoftwareKeyboard`
     applet ("Dying message") at 2:40; Ryujinx Canary 1.3.354 ran 330 s cleanly with no exit.
   - **Phase 7 cleanup:** removed `R#17..60` read logs from `src/runtime_file.c` and the hardcoded
@@ -48,19 +51,16 @@ Last updated: 2026-11-22. Branch: `switch-port`. This is the only handoff docume
   2. Guest pool sized to 2176 MiB direct + 32 MiB flexible; render-target attachments guarded
      (`Rasterizer::AttachImage`).
 
-### 0.1 Remaining items (before / on Switch hardware)
-1. **30-min soak** in Ryujinx (or manual play into first real dungeon stage + boss) to confirm long-run
-   arena stability and zero intermittent 17 s stall (not reproduced across 8 consecutive Canary 1.3.354
-   runs).
-2. **Real Switch hardware boot** (Title Takeover, hold R on a game): deploy with
+### 0.1 Remaining items (Switch hardware)
+1. **Real Switch hardware boot** (Title Takeover, hold R on a game): deploy with
    `tools/prepare_nx.ps1 -SplitCpk`, verify visual output, `libnx audout` audio, FPS, and
    `heap_free`/`arena` in `logs/bringup.log`.
-3. **Pad mapping (hardware check):** confirm whether Switch physical B arrives as Cross (positional)
+2. **Pad mapping (hardware check):** confirm whether Switch physical B arrives as Cross (positional)
    or A (label); adjust `PAD_MAP=cross=b,circle=a` in `nx.ini` if inverted, then make it default.
-4. **C++ throw in Ryujinx (known Ryujinx quirk, non-hardware):** libgcc's unwinder executes 5
+3. **C++ throw in Ryujinx (known Ryujinx quirk, non-hardware):** libgcc's unwinder executes 5
    `chkfeat x16` (`0xd503251f`) before `mrs gcspr_el0`; Cortex-A57 hardware treats `chkfeat` as NOP.
    Only needed if a Ryujinx test hits a C++ throw.
-5. **`NX_SAFE=0` features** (later): guest-hook features need >4-arg/XMM host→guest marshalling (§7).
+4. **`NX_SAFE=0` features** (later): guest-hook features need >4-arg/XMM host→guest marshalling (§7).
 
 ### 0.2 Diagnostics kept behind `nx.ini` knobs
 - `GL_DEBUG=1`: KHR_debug synchronous callback (`GL_DBG` in `bringup.log`).
@@ -159,11 +159,11 @@ Game-side detail (from static analysis of `boot.bin`, kept for reference):
 - Next: §0.1 (invisible character first) → first real stage → 30-min soak.
 - `NX_SAFE=0` features one by one later (needs >4-arg/XMM host→guest marshalling, §7).
 
-### Phase 5 — Ryujinx gate before hardware (done except 30-min soak)
-- Done: `MemoryManagerMode` SoftwarePageTable (`softpt-gate`, 1260 frames, `glErr=0x0`),
+### Phase 5 — Ryujinx gate before hardware (done 2026-11-23)
+- `MemoryManagerMode` SoftwarePageTable (`softpt-gate`, 1260 frames, `glErr=0x0`),
   `BOX64_DYNAREC_STRONGMEM=1` defaulted on, RAM margin (`heap_free=372–436 MiB`,
-  `arena=568–614/800 MiB`), split CPK (`DRACRO.CPK.000/.001`), direct `libnx audout` stereo audio.
-- Remaining: 30-min soak (or manual play into first real dungeon stage).
+  `arena=568–614/800 MiB`), split CPK (`DRACRO.CPK.000/.001`), direct `libnx audout` stereo audio,
+  and 30-min soak (`soak-30m`, 21,180 frames, 9.33M draws, `glErr=0x0`).
 
 ### Phase 6 — Hardware
 - `tools/prepare_nx.ps1 -SplitCpk` to SD, same `nx.ini` as the passing Ryujinx run, Title Takeover

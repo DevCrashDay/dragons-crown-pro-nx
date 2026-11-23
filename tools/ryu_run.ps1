@@ -46,7 +46,9 @@ if ($Pad) {
     [IO.File]::WriteAllText($PadFile, "")
     $presses = @($Pad -split "," | ForEach-Object {
         $t, $b = $_ -split ":", 2
-        [pscustomobject]@{ At = [double]$t; Buttons = ($b -replace "\+", " "); Done = $false }
+        $hold = 200
+        if ($b -match "^(.+)@(\d+)$") { $b = $Matches[1]; $hold = [int]$Matches[2] }
+        [pscustomobject]@{ At = [double]$t; Buttons = ($b -replace "\+", " "); HoldMs = $hold; Done = $false }
     } | Sort-Object At)
 }
 $iniText = ($settings.Keys | ForEach-Object { "$_=$($settings[$_])" }) -join "`n"
@@ -78,10 +80,10 @@ while ((Get-Date) -lt $deadline) {
     foreach ($p in $presses) {
         if (-not $p.Done -and $elapsed -ge $p.At) {
             [IO.File]::WriteAllText($PadFile, $p.Buttons)
-            Start-Sleep -Milliseconds 200
+            Start-Sleep -Milliseconds $p.HoldMs
             [IO.File]::WriteAllText($PadFile, "")
             $p.Done = $true
-            Write-Host ("ryu_run: {0,6:N1}s pressed {1}" -f $elapsed, $p.Buttons)
+            Write-Host ("ryu_run: {0,6:N1}s pressed {1} ({2}ms)" -f $elapsed, $p.Buttons, $p.HoldMs)
         }
     }
     if ((Get-Date) -lt $nextCheck) { continue }
