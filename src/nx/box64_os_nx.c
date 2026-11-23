@@ -81,7 +81,17 @@ static void sysv_wrapper(x64emu_t *emu, uintptr_t fn) {
     uint64_t gpr[6] = {R_RDI, R_RSI, R_RDX, R_RCX, R_R8, R_R9};
     uint8_t xmm[8][16], q0[16];
     for (int i = 0; i < 8; ++i) memcpy(xmm[i], &emu->xmm[i], 16);
-    uint64_t rax = nx_sysv_call((void *)fn, gpr, xmm, (const uint64_t *)(uintptr_t)(R_RSP + 8), SYSV_STACK_ARGS, q0);
+    uintptr_t sp = (uintptr_t)(R_RSP + 8);
+    uint64_t stack_count = SYSV_STACK_ARGS;
+    /* Do not read past the top of a guest stack into an unmapped/guard page. */
+    if ((sp & 0xFFF) > 0x1000 - SYSV_STACK_ARGS * 8) {
+        MemoryInfo mi = {0};
+        u32 pi = 0;
+        if (R_FAILED(svcQueryMemory(&mi, &pi, (sp + 0xFFF) & ~0xFFFULL)) || (mi.perm & Perm_R) == 0) {
+            stack_count = (0x1000 - (sp & 0xFFF)) / 8;
+        }
+    }
+    uint64_t rax = nx_sysv_call((void *)fn, gpr, xmm, (const uint64_t *)sp, stack_count, q0);
     R_RAX = rax;
     R_RDX = 0; /* no 128-bit integer returns from HLE functions */
     memcpy(&emu->xmm[0], q0, 16);
