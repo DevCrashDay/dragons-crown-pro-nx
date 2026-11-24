@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdio>
+
+#include "dcp_toggles.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -78,17 +82,51 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
+#ifdef __SWITCH__
+// STALL_DUMP: where a guest thread waits inside a gnm call, and the submit handshake state.
+extern "C" void nx_hle_subphase(const char* sub);
+static void NxHleSub(const char* sub) {
+    nx_hle_subphase(sub);
+}
+#else
+static void NxHleSub(const char*) {}
+#endif
+
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_wait_idle};
+    DcpStats::lock_resets.fetch_add(1, std::memory_order_relaxed);
     submission_lock = 0;
     cv_lock.notify_all();
 }
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    NxHleSub("wait_idle");
+    DcpStats::WaitTimer wait_timer{DcpStats::guest_gpu_wait_ns};
     std::unique_lock lock{m_wait_idle};
-    cv_lock.wait(lock, [] { return submission_lock == 0; });
+    // dcp: a lost GpuIdle wakeup (seen under Ryujinx: lock set, GPU thread asleep with nothing
+    // queued) blocked the guest forever. Re-check, and drop a lock the retired GPU left behind.
+    while (!cv_lock.wait_for(lock, std::chrono::milliseconds(5),
+                             [] { return submission_lock == 0; })) {
+        if (liverpool && liverpool->IsGpuIdle()) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                std::printf("GnmDriver: stale submission lock dropped (GPU idle, no wakeup)\n");
+            }
+            DcpStats::lock_heals.fetch_add(1, std::memory_order_relaxed);
+            submission_lock = 0;
+            break;
+        }
+    }
+    NxHleSub("submit");
 }
+
+#ifdef __SWITCH__
+extern "C" unsigned nx_gnm_state(void) {
+    return submission_lock | (liverpool && liverpool->IsGpuIdle() ? 0x100u : 0u);
+}
+#endif
 
 // Write a special ending NOP packet with N DWs data block
 static inline u32* WriteTrailingNop(u32* cmdbuf, u32 data_block_size) {
@@ -298,6 +336,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
+    NxHleSub("submit_lock");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
 
@@ -2295,6 +2334,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
+    NxHleSub("submit_lock");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
 
@@ -2338,6 +2378,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
+    NxHleSub("submit_lock");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
 
@@ -2355,10 +2396,15 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    NxHleSub("submit_lock");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    {
+        std::unique_lock lk_idle{m_wait_idle};
+        if (!liverpool->IsGpuIdle()) {
+            DcpStats::lock_sets.fetch_add(1, std::memory_order_relaxed);
+            submission_lock = true;
+        }
     }
     liverpool->SubmitDone();
     send_init_packet = true;
@@ -2919,6 +2965,8 @@ int PS4_SYSV_ABI Func_F916890425496553() {
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
+    Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
+                                         nullptr);
     liverpool = std::make_unique<AmdGpu::Liverpool>();
     presenter = VideoCore::CreatePresenter(*g_window, liverpool.get());
 
@@ -2930,9 +2978,6 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         liverpool->ReserveCopyBufferSpace();
     }
-
-    Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
-                                         nullptr);
 
     LIB_FUNCTION("b0xyllnVY-I", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAddEqEvent);
     LIB_FUNCTION("b08AgtPlHPg", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAreSubmitsAllowed);

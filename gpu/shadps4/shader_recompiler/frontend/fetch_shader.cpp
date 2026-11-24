@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
-#include <unordered_map>
 #include <vector>
+#include <tsl/robin_map.h>
 #include "dcp_toggles.h"
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -92,12 +92,12 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
-std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+const FetchShaderData* ParseFetchShaderPtr(const Shader::Info& info) {
     if (compiler_snapshot && compiler_snapshot->info == &info) {
-        return compiler_snapshot->fetch;
+        return compiler_snapshot->fetch ? &*compiler_snapshot->fetch : nullptr;
     }
     if (!info.has_fetch_shader) {
-        return std::nullopt;
+        return nullptr;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
@@ -109,11 +109,19 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         std::vector<u32> code;
         FetchShaderData data;
     };
-    thread_local std::unordered_map<const u32*, CachedParse> cache;
-    if (const auto it = cache.find(code);
-        !DcpToggle::Disabled(DcpToggle::FetchShaderCache) && it != cache.end() &&
+    thread_local tsl::robin_map<const u32*, CachedParse> cache;
+    thread_local const u32* last_code = nullptr;
+    thread_local const CachedParse* last_entry = nullptr;
+    const bool use_cache = !DcpToggle::Disabled(DcpToggle::FetchShaderCache);
+    if (use_cache && code == last_code && last_entry &&
+        std::memcmp(code, last_entry->code.data(), last_entry->code.size() * sizeof(u32)) == 0) {
+        return &last_entry->data;
+    }
+    if (const auto it = cache.find(code); use_cache && it != cache.end() &&
         std::memcmp(code, it->second.code.data(), it->second.code.size() * sizeof(u32)) == 0) {
-        return it->second.data;
+        last_code = code;
+        last_entry = &it->second;
+        return &it->second.data;
     }
 
     FetchShaderData data{};
@@ -173,11 +181,23 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
     }
 
+    last_code = nullptr;
+    last_entry = nullptr;
     if (cache.size() >= 4096) {
         cache.clear();
     }
-    cache[code] = CachedParse{std::vector<u32>(code, code_slice.position()), data};
-    return data;
+    auto [it, _] =
+        cache.insert_or_assign(code, CachedParse{std::vector<u32>(code, code_slice.position()), data});
+    last_code = code;
+    last_entry = &it->second;
+    return &it->second.data;
+}
+
+std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    if (const auto* data = ParseFetchShaderPtr(info)) {
+        return *data;
+    }
+    return std::nullopt;
 }
 
 } // namespace Shader::Gcn

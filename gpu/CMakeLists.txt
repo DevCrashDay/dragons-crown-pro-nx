@@ -165,8 +165,16 @@ if (DCP_SWITCH)
     target_compile_definitions(dcpgpu PUBLIC DCP_SWITCH_OPENGL_ONLY=1 BOOST_ALL_NO_LIB=1 BOOST_CONTAINER_NO_LIB=1 VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0 IMGUI_IMPL_OPENGL_LOADER_CUSTOM=1)
     set_source_files_properties(third_party/imgui/backends/imgui_impl_opengl3.cpp PROPERTIES COMPILE_OPTIONS "-include;glad/glad.h")
     target_compile_options(dcpgpu PRIVATE -include ${CMAKE_SOURCE_DIR}/src/nx/compat_headers/sys/un.h)
-    target_link_libraries(dcpgpu PUBLIC Vulkan::Headers fmt::fmt magic_enum tsl::robin_map
-        xxhash PkgConfig::SDL2 PkgConfig::PNG miniz Zydis dcp_keys glad EGL glapi drm_nouveau)
+    if (DCP_MESA_SWITCH)
+        target_compile_definitions(dcpgpu PUBLIC DCP_MESA_SWITCH=1)
+        find_package(OpenGL CONFIG REQUIRED PATHS "${DCP_MESA_SWITCH_SDK}/lib/cmake/OpenGL" NO_DEFAULT_PATH)
+        target_include_directories(dcpgpu BEFORE PRIVATE "${DCP_MESA_SWITCH_SDK}/include")
+        target_link_libraries(dcpgpu PUBLIC Vulkan::Headers fmt::fmt magic_enum tsl::robin_map
+            xxhash PkgConfig::SDL2 PkgConfig::PNG miniz Zydis dcp_keys glad OpenGL::EGL OpenGL::GL OpenGL::GLES2)
+    else()
+        target_link_libraries(dcpgpu PUBLIC Vulkan::Headers fmt::fmt magic_enum tsl::robin_map
+            xxhash PkgConfig::SDL2 PkgConfig::PNG miniz Zydis dcp_keys glad EGL glapi drm_nouveau)
+    endif()
 else()
     target_link_libraries(dcpgpu PUBLIC Vulkan::Headers Vulkan::Vulkan fmt::fmt Boost::headers magic_enum tsl::robin_map
         VulkanMemoryAllocator PkgConfig::XXHASH SDL3::SDL3 PNG::PNG miniz Zydis::Zydis sirit dcp_keys)

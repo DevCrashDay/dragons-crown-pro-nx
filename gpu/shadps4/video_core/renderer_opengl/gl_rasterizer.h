@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <tsl/robin_map.h>
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_backend.h"
 #include "video_core/renderer_opengl/gl_api.h"
@@ -30,6 +32,37 @@ class MemoryManager;
 }
 
 namespace OpenGL {
+
+#ifdef __SWITCH__
+struct NxProfTicks {
+    std::atomic<u64> draw{};
+    std::atomic<u64> refresh{};
+    std::atomic<u64> gl_draw{};
+    std::atomic<u64> swap{};
+    std::atomic<u64> shd{};
+    std::atomic<u64> tgt{};
+    std::atomic<u64> stg{};
+    std::atomic<u64> vtx{};
+    std::atomic<u64> cmt{};
+    std::atomic<u64> st{};
+    std::atomic<u64> cs{};       // DispatchDirect: compute emulated on the CPU
+    std::atomic<u64> cs_count{}; // dispatches
+    std::atomic<u64> present{};  // PrepareFrame + Show, swap included
+};
+inline NxProfTicks g_nx_prof;
+inline u64 NxTick() {
+    u64 v;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+}
+struct NxProfScope {
+    std::atomic<u64>& bucket;
+    u64 t0 = NxTick();
+    ~NxProfScope() {
+        bucket.fetch_add(NxTick() - t0, std::memory_order_relaxed);
+    }
+};
+#endif
 
 class Rasterizer final : public VideoCore::RasterizerBackend {
 public:
@@ -129,6 +162,19 @@ private:
     bool UniformChanged(Sent& sent, const Value& value);
     bool BindTargets(const GraphicsProgram& program, AttachedTargets& targets);
     GLuint FramebufferFor(const AttachedTargets& targets);
+    /// A buffer fill that covers a whole GPU-written color image, done as a GL clear; null if
+    /// the image or value does not qualify (the caller re-uploads instead).
+    Image* ClearFilledImage(VAddr address, u64 size, u32 value);
+    /// Last BufferFillShader fill per address: lets a repeated fill skip the CPU write.
+    struct LastFill {
+        u64 bytes{};
+        u32 value{};
+        u64 hash{};
+    };
+    std::array<u32, AmdGpu::NUM_CLIP_PLANES * 4> cached_clip_planes{};
+    u32 cached_clip_planes_gen{};
+    u32 cached_clip_planes_offset{StreamRing::NoOffset};
+    tsl::robin_map<VAddr, LastFill> last_fills;
     bool AttachImage(GLenum attachment, const Image& image);
     void ClearTargets(const AttachedTargets& targets);
     void BindStage(const Shader::Info& info, StageLocations& locations,
@@ -178,6 +224,9 @@ private:
         std::array<GLuint, AmdGpu::NUM_COLOR_BUFFERS + 1> textures;
     };
     std::unordered_map<u64, CachedFramebuffer> framebuffers;
+    u64 last_framebuffer_key{};
+    GLuint last_framebuffer{};
+    bool has_last_framebuffer{};
     struct SamplerKey {
         u64 raw0;
         u64 raw1;
@@ -190,7 +239,10 @@ private:
             return size_t(key.raw0 ^ (key.raw1 * 31) ^ u64(key.shadow) ^ (u64(key.nearest_only) << 1));
         }
     };
-    std::unordered_map<SamplerKey, GLuint, SamplerKeyHash> samplers;
+    tsl::robin_map<SamplerKey, GLuint, SamplerKeyHash> samplers;
+    SamplerKey last_sampler_key{};
+    GLuint last_sampler{};
+    bool has_last_sampler{};
     std::vector<u8> gds;
     std::vector<u32> expanded_indices;
     std::vector<std::array<u32, 4>> rect_input_table;

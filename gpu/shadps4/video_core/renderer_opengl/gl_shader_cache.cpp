@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cstdio>
+#include <cstring>
 #include <span>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
@@ -92,7 +94,170 @@ void BindSamplerUnits(GLuint program, const Shader::Backend::GLSL::Stage* stage,
     }
 }
 
+void SyncStageUserData(Shader::Info& info, const Shader::ShaderParams& params) {
+    info.pgm_base = params.Base();
+    info.user_data = params.user_data;
+    if (!info.srt_info.walker_func && info.srt_info.ops.empty() &&
+        info.flattened_ud_buf.size() >= params.user_data.size()) {
+        if (std::memcmp(info.flattened_ud_buf.data(), params.user_data.data(),
+                        params.user_data.size_bytes()) != 0) {
+            std::memcpy(info.flattened_ud_buf.data(), params.user_data.data(),
+                        params.user_data.size_bytes());
+        }
+    } else {
+        info.RefreshFlatBuf();
+    }
+}
+
+u32 PackStageCommon(const auto& program) {
+    return u32(program.settings.num_user_regs) | (u32(program.settings.vgpr_comp_cnt) << 5) |
+           (u32(program.settings.num_vgprs) << 7) |
+           (u32(program.settings.fp_denorm_mode32) << 13) |
+           (u32(program.settings.fp_denorm_mode64) << 15) |
+           (u32(program.settings.fp_round_mode32) << 17) |
+           (u32(program.settings.fp_round_mode64) << 19);
+}
+
+static_assert(sizeof(AmdGpu::VsOutputControl) == sizeof(u32));
+
+u32 PackVsOutCtl(const AmdGpu::VsOutputControl& ctl) {
+    return std::bit_cast<u32>(ctl) & 0x03FFFFFFu;
+}
+
+u32 PackClipper(const AmdGpu::Regs& regs) {
+    return (u32(regs.clipper_control.user_clip_plane_enable) & 0x3Fu) |
+           (u32(regs.clipper_control.clip_space) << 6) | (u32(regs.IsClipDisabled()) << 7);
+}
+
+bool PackTessEmulated(const AmdGpu::Regs& regs) {
+    return regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
+           regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+}
+
+u8 PackMrtzMask(const AmdGpu::DepthShaderControl& ctl) {
+    const u8 stencil_ref = ctl.stencil_op_val_export_enable | ctl.stencil_test_val_export_enable;
+    return u8(ctl.z_export_enable | (stencil_ref << 1) | (ctl.mask_export_enable << 2) |
+              (ctl.coverage_to_mask_enable << 3));
+}
+
+bool PackDualSourceBlend(const AmdGpu::BlendControl& blend) {
+    if (!blend.enable) {
+        return false;
+    }
+    using Vulkan::LiverpoolToVK::IsDualSourceBlendFactor;
+    if (IsDualSourceBlendFactor(blend.color_dst_factor) ||
+        IsDualSourceBlendFactor(blend.color_src_factor)) {
+        return true;
+    }
+    return blend.separate_alpha_blend && (IsDualSourceBlendFactor(blend.alpha_dst_factor) ||
+                                          IsDualSourceBlendFactor(blend.alpha_src_factor));
+}
+
+u16 PackPsInput(const AmdGpu::PsInputControl& in) {
+    return u16(in.input_offset | (in.use_default << 5) | (in.flat_shade << 6) |
+               (in.default_value << 7));
+}
+
+Shader::PsColorBuffer PackColorBuf(const AmdGpu::Regs& regs, u32 cb) {
+    const auto& buffer = regs.color_buffers[cb];
+    Shader::PsColorBuffer color{};
+    color.data_format = buffer.GetDataFmt();
+    color.num_format = buffer.GetNumberFmt();
+    color.num_conversion = buffer.GetNumberConversion();
+    color.export_format = regs.color_export_format.GetFormat(cb);
+    color.swizzle = buffer.Swizzle();
+    return color;
+}
+
+u8 PackNumSamples(const AmdGpu::Regs& regs) {
+    return regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
+               ? u8(regs.aa_config.NumSamples())
+               : u8{1};
+}
+
+u8 ActiveColorBufferMask(const AmdGpu::Regs& regs) {
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return 0;
+    }
+    u8 mask = 0;
+    for (u32 cb = 0; cb < Shader::MaxColorBuffers; ++cb) {
+        if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) {
+            mask |= u8(1u << cb);
+        }
+    }
+    return mask;
+}
+
 } // namespace
+
+void ShaderCache::FillVsRuntimeKey(const AmdGpu::Regs& regs, VsRuntimeKey& key) {
+    key.common = PackStageCommon(regs.vs_program);
+    key.clipper = PackClipper(regs);
+    key.vs_output_control = PackVsOutCtl(regs.vs_output_control);
+    key.step_rate_0 = regs.vgt_instance_step_rate_0;
+    key.step_rate_1 = regs.vgt_instance_step_rate_1;
+    key.tess_emulated = PackTessEmulated(regs);
+}
+
+bool ShaderCache::MatchesVsRuntimeKey(const AmdGpu::Regs& regs, const VsRuntimeKey& key) {
+    return key.common == PackStageCommon(regs.vs_program) &&
+           key.clipper == PackClipper(regs) &&
+           key.vs_output_control == PackVsOutCtl(regs.vs_output_control) &&
+           key.step_rate_0 == regs.vgt_instance_step_rate_0 &&
+           key.step_rate_1 == regs.vgt_instance_step_rate_1 &&
+           key.tess_emulated == PackTessEmulated(regs);
+}
+
+void ShaderCache::FillFsRuntimeKey(const AmdGpu::Regs& regs, FsRuntimeKey& key) {
+    key.common = PackStageCommon(regs.ps_program);
+    key.en_flags = regs.ps_input_ena;
+    key.addr_flags = regs.ps_input_addr;
+    key.num_interp = u8(regs.num_interp);
+    key.front_face_all_bits = u8(regs.barycentric_control.front_face_all_bits);
+    key.num_samples = PackNumSamples(regs);
+    key.mrtz_mask = PackMrtzMask(regs.depth_shader_control);
+    key.active_cb_mask = ActiveColorBufferMask(regs);
+    key.dual_source_blending = PackDualSourceBlend(regs.blend_control[0]);
+    key.z_export_format = regs.z_export_format;
+    for (u32 i = 0; i < regs.num_interp; ++i) {
+        key.ps_inputs[i] = PackPsInput(regs.ps_inputs[i]);
+    }
+    for (u32 m = key.active_cb_mask; m != 0;) {
+        const u32 cb = std::countr_zero(m);
+        m &= m - 1;
+        key.color_buffers[cb] = PackColorBuf(regs, cb);
+    }
+}
+
+bool ShaderCache::MatchesFsRuntimeKey(const AmdGpu::Regs& regs, const FsRuntimeKey& key) {
+    if (key.common != PackStageCommon(regs.ps_program) ||
+        key.en_flags != regs.ps_input_ena || key.addr_flags != regs.ps_input_addr ||
+        key.num_interp != u8(regs.num_interp) ||
+        key.front_face_all_bits != u8(regs.barycentric_control.front_face_all_bits) ||
+        key.num_samples != PackNumSamples(regs) ||
+        key.mrtz_mask != PackMrtzMask(regs.depth_shader_control) ||
+        key.z_export_format != regs.z_export_format ||
+        key.dual_source_blending != PackDualSourceBlend(regs.blend_control[0])) {
+        return false;
+    }
+    const u8 active_cb_mask = ActiveColorBufferMask(regs);
+    if (key.active_cb_mask != active_cb_mask) {
+        return false;
+    }
+    for (u32 i = 0; i < regs.num_interp; ++i) {
+        if (key.ps_inputs[i] != PackPsInput(regs.ps_inputs[i])) {
+            return false;
+        }
+    }
+    for (u32 m = active_cb_mask; m != 0;) {
+        const u32 cb = std::countr_zero(m);
+        m &= m - 1;
+        if (key.color_buffers[cb] != PackColorBuf(regs, cb)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 PrimitiveExpansion ExpansionOf(AmdGpu::PrimitiveType type, Shader::Backend::GLSL::Target target,
                                bool rect_tables) {
@@ -207,25 +372,22 @@ Shader::RuntimeInfo ShaderCache::BuildRuntimeInfo(const AmdGpu::Regs& regs, HwSt
 
 StageModule* ShaderCache::GetModule(HwStage hw_stage, SwStage sw_stage,
                                     const Shader::ShaderParams& params,
-                                    Shader::RuntimeInfo runtime_info) {
+                                    const Shader::RuntimeInfo& runtime_info) {
     auto& modules = programs[params.hash];
     for (auto& module : modules) {
-        auto& info = *module->info;
-        info.pgm_base = params.Base();
-        info.user_data = params.user_data;
-        info.RefreshFlatBuf();
-        const Shader::StageSpecialization spec(info, runtime_info, profile, {});
-        if (module->spec == spec) {
+        SyncStageUserData(*module->info, params);
+        if (module->spec.Matches(*module->info, runtime_info)) {
             return module.get();
         }
     }
     auto module = std::make_unique<StageModule>();
     module->info = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
+    Shader::RuntimeInfo rt = runtime_info;
     const auto program =
-        Shader::TranslateProgram(params.code, pools, *module->info, runtime_info, profile);
-    module->spec = Shader::StageSpecialization(*module->info, runtime_info, profile, {});
+        Shader::TranslateProgram(params.code, pools, *module->info, rt, profile);
+    module->spec = Shader::StageSpecialization(*module->info, rt, profile, {});
     if (sw_stage != SwStage::Compute) {
-        module->glsl = Shader::Backend::GLSL::EmitGLSL(profile, runtime_info, program, target);
+        module->glsl = Shader::Backend::GLSL::EmitGLSL(profile, rt, program, target);
     }
     LOG_INFO(Render, "OpenGL: recompiled {} shader {:#x} (permutation {})",
              magic_enum::enum_name(hw_stage), params.hash, modules.size());
@@ -313,15 +475,47 @@ GraphicsProgram* ShaderCache::GetGraphics(const AmdGpu::Regs& regs, bool rect_ta
         return nullptr;
     }
     const auto vs_params = AmdGpu::GetParams(*vs_program);
+    const auto* ps_program = regs.ProgramForStage(u32(HwStage::Fragment));
+    const bool has_ps = regs.stage_enable.IsStageEnabled(u32(HwStage::Fragment)) && ps_program &&
+                        ps_program->Address<u32*>();
+    const auto ps_params =
+        has_ps ? AmdGpu::GetParams(*ps_program)
+               : Shader::ShaderParams{regs.ps_program.user_data, {}, 0};
+    const auto expansion = ExpansionOf(regs.primitive_type, target, rect_tables);
+
+    const u32* vs_code = vs_params.code.data();
+    const u32* ps_code = ps_params.code.data();
+    const size_t fast_idx =
+        ((uintptr_t(vs_code) >> 4) ^
+         ((ps_code ? uintptr_t(ps_code) >> 4 : 0) * 0x9E3779B97F4A7C15ULL) ^
+         (u64(expansion) * 0xBF58476D1CE4E5B9ULL)) &
+        (FastSlotCount - 1);
+    auto& slot = fast_graphics[fast_idx];
+    if (slot.program && slot.vs_code == vs_code && slot.vs_hash == vs_params.hash &&
+        slot.ps_code == ps_code && slot.ps_hash == ps_params.hash && slot.expansion == expansion &&
+        MatchesVsRuntimeKey(regs, slot.vs_key) &&
+        (!has_ps || MatchesFsRuntimeKey(regs, slot.fs_key))) {
+        auto* vertex = slot.program->vertex;
+        SyncStageUserData(*vertex->info, vs_params);
+        if (vertex->spec.Matches(*vertex->info, vertex->spec.runtime_info, {}, false)) {
+            auto* fragment = slot.program->fragment;
+            if (!fragment) {
+                return slot.program;
+            }
+            SyncStageUserData(*fragment->info, ps_params);
+            if (fragment->spec.Matches(*fragment->info, fragment->spec.runtime_info, {}, false)) {
+                return slot.program;
+            }
+        }
+    }
+
     StageModule* vertex =
         GetModule(HwStage::Vertex, SwStage::Vertex, vs_params,
                   BuildRuntimeInfo(regs, HwStage::Vertex, SwStage::Vertex));
 
     StageModule* fragment = nullptr;
-    const auto* ps_program = regs.ProgramForStage(u32(HwStage::Fragment));
-    if (regs.stage_enable.IsStageEnabled(u32(HwStage::Fragment)) && ps_program &&
-        ps_program->Address<u32*>()) {
-        fragment = GetModule(HwStage::Fragment, SwStage::Fragment, AmdGpu::GetParams(*ps_program),
+    if (has_ps) {
+        fragment = GetModule(HwStage::Fragment, SwStage::Fragment, ps_params,
                              BuildRuntimeInfo(regs, HwStage::Fragment, SwStage::Fragment));
     }
 
@@ -335,9 +529,23 @@ GraphicsProgram* ShaderCache::GetGraphics(const AmdGpu::Regs& regs, bool rect_ta
             return nullptr;
         }
     }
-    const auto expansion = ExpansionOf(regs.primitive_type, target, rect_tables);
     const auto it = graphics.find(ProgramKey{vertex, fragment, expansion});
-    return it != graphics.end() ? it->second.get() : Link(vertex, fragment, expansion);
+    GraphicsProgram* program = it != graphics.end() ? it->second.get() : Link(vertex, fragment, expansion);
+    if (program) {
+        slot.vs_code = vs_code;
+        slot.ps_code = ps_code;
+        slot.vs_hash = vs_params.hash;
+        slot.ps_hash = ps_params.hash;
+        slot.expansion = expansion;
+        slot.program = program;
+        slot.vs_key = {};
+        FillVsRuntimeKey(regs, slot.vs_key);
+        slot.fs_key = {};
+        if (has_ps) {
+            FillFsRuntimeKey(regs, slot.fs_key);
+        }
+    }
+    return program;
 }
 
 Shader::Info* ShaderCache::GetCompute(const AmdGpu::ComputeProgram& program) {

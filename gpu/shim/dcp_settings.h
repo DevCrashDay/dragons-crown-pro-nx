@@ -24,12 +24,23 @@ enum Feature : unsigned {
 
 struct Values {
     // Frame counter overlay: font size in percent and corner (0 top left, 1 top right, 2 bottom left, 3 bottom right).
+#ifdef __SWITCH__
+    std::atomic<bool> show_fps{true};
+    std::atomic<int> overlay_scale{100}, overlay_corner{0};
+#else
     std::atomic<bool> show_fps{false};
     std::atomic<int> overlay_scale{100}, overlay_corner{1};
+#endif
     // The Ping panel (Online Play only), below the frame counter. F3 switches it for the session; never saved here.
     std::atomic<bool> show_ping{false};
     std::atomic<int> display_mode{0};
+#ifdef __SWITCH__
+    // PresentThread already paces flips to 60 Hz; Horizon NWindow scans out on Display VSync,
+    // while swap interval 1 stalls GpuCommandProcessor whenever the two 60 Hz clocks drift.
+    std::atomic<bool> vsync{false};
+#else
     std::atomic<bool> vsync{true};
+#endif
     std::atomic<int> presentation{0}; ///< DcpGraphics::Presentation: letterbox or stretch
     std::atomic<bool> fsr1{false};
     std::atomic<bool> rcas{true};

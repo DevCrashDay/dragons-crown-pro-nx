@@ -204,7 +204,12 @@ extern "C" unsigned runtime_cheat_refills_pending(void) {
 }
 
 extern "C" int runtime_cheats_hooks_wanted(int build_has_hooks) {
+#ifdef __SWITCH__
+    (void)build_has_hooks;
+    return 0; /* cheat_hooks.cpp calls x86_64 guest pointers directly */
+#else
     return build_has_hooks && !OnlineSessionActive() ? 1 : 0;
+#endif
 }
 
 extern "C" int runtime_cheats_log_state(int build_has_hooks) {

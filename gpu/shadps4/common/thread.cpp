@@ -30,6 +30,9 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#ifdef __SWITCH__
+extern "C" void nx_platform_set_realtime_thread(void);
+#endif
 
 #ifdef __FreeBSD__
 #define cpu_set_t cpuset_t
@@ -69,6 +72,14 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
         LOG_ERROR(Common, "Could not set thread to real-time with period {} ns: {}",
                   period_ns.count(), ret);
     }
+}
+
+#elif defined(__SWITCH__)
+
+void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
+    (void)period_ns;
+    // Keep PresentThread (60 Hz vblank pacer) above GPU (48) and guest/worker (59) threads.
+    nx_platform_set_realtime_thread();
 }
 
 #else

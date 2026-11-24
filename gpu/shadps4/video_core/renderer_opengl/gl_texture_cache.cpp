@@ -15,6 +15,7 @@
 #include "video_core/renderer_opengl/gl_texture_cache.h"
 
 #ifdef __SWITCH__
+#include "video_core/renderer_opengl/gl_rasterizer.h"
 extern "C" void nx_platform_trace(const char* format, ...);
 #endif
 
@@ -40,6 +41,22 @@ bool IsSrgbFormat(vk::Format format) {
 
 u64 ReadableSize(VAddr address, u64 size) {
     return Core::Memory::Instance()->ClampRangeSize(address, size);
+}
+
+u64 HashTextureContent(const u8* data, u64 size) {
+#ifdef __SWITCH__
+    constexpr u64 FullLimit = 32 * 1024;
+    constexpr u64 Window = 4096;
+    if (size <= FullLimit) {
+        return XXH3_64bits(data, size);
+    }
+    u64 hash = XXH3_64bits_withSeed(data, Window, size);
+    hash = XXH3_64bits_withSeed(data + size / 3, Window, hash);
+    hash = XXH3_64bits_withSeed(data + (size * 2) / 3, Window, hash);
+    return XXH3_64bits_withSeed(data + size - Window, Window, hash);
+#else
+    return HashGuestRange(data, size);
+#endif
 }
 
 } // namespace
@@ -260,14 +277,22 @@ void TextureCache::Refresh(Image& image) {
         }
     }
     const auto* guest = reinterpret_cast<const u8*>(info.guest_address);
+    if (info.props.is_depth) {
+        // Depth targets are never uploaded from guest memory, so skip expensive hashing.
+        return;
+    }
+#ifdef __SWITCH__
+    const u64 t0 = NxTick();
+    const u64 hash = HashTextureContent(guest, size);
+    g_nx_prof.refresh.fetch_add(NxTick() - t0, std::memory_order_relaxed);
+#else
     const u64 hash = image.gpu_written ? HashGuestRange(guest, size) : XXH3_64bits(guest, size);
+#endif
     if (hash == image.content_hash) {
         return;
     }
     image.content_hash = hash;
-    if (!info.props.is_depth) {
-        Upload(image);
-    }
+    Upload(image);
     if (image.gpu_written) {
         ++resolve_generation;
     }
@@ -283,14 +308,18 @@ void TextureCache::MarkTarget(Image& image) {
     image.gpu_written = true;
     ++resolve_generation;
     const auto& info = image.info;
+    if (info.props.is_depth) {
+        image.content_hash = 0;
+        return;
+    }
     const u64 size = ReadableSize(info.guest_address, info.guest_size);
     image.content_hash =
-        size ? HashGuestRange(reinterpret_cast<const u8*>(info.guest_address), size) : 0;
+        size ? HashTextureContent(reinterpret_cast<const u8*>(info.guest_address), size) : 0;
 }
 
 // Refresh would see this only at the next frame's first use, or not at all when the bytes match
 // last time's, and would then replace whatever was rendered after the write.
-void TextureCache::NoteGpuWrite(VAddr address, u64 size) {
+void TextureCache::NoteGpuWrite(VAddr address, u64 size, const Image* cleared) {
     const VAddr end = address + size;
     for (auto& [base, list] : images) {
         for (auto& image : list) {
@@ -305,12 +334,13 @@ void TextureCache::NoteGpuWrite(VAddr address, u64 size) {
                 image->watched = false;
                 continue;
             }
-            if (address <= info.guest_address && end >= image_end && !info.props.is_depth) {
+            if (address <= info.guest_address && end >= image_end && !info.props.is_depth &&
+                image.get() != cleared) {
                 Upload(*image);
             }
             const u64 readable = ReadableSize(info.guest_address, info.guest_size);
             image->content_hash =
-                readable ? HashGuestRange(reinterpret_cast<const u8*>(info.guest_address), readable)
+                readable ? HashTextureContent(reinterpret_cast<const u8*>(info.guest_address), readable)
                          : 0;
             image->checked_frame = frame;
             image->watched = false;
@@ -503,6 +533,20 @@ Image* TextureCache::FindDisplayBuffer(const Libraries::VideoOut::BufferAttribut
         for (auto& candidate : it->second) {
             if (candidate->gpu_written && candidate->target == GL_TEXTURE_2D) {
                 image = candidate.get();
+            }
+        }
+    }
+    if (!image) {
+        for (const auto& [base, list] : images) {
+            if (base > address || address - base >= 0x10000) {
+                continue;
+            }
+            for (const auto& candidate : list) {
+                if (candidate->gpu_written && candidate->target == GL_TEXTURE_2D &&
+                    candidate->info.size.width == info.size.width &&
+                    candidate->info.size.height == info.size.height) {
+                    image = candidate.get();
+                }
             }
         }
     }

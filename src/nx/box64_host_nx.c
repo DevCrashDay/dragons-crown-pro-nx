@@ -161,7 +161,27 @@ int madvise(void *addr, size_t len, int advice) { (void)addr; (void)len; (void)a
 int shm_open(const char *name, int oflag, mode_t mode) { (void)name; (void)oflag; (void)mode; errno = ENOSYS; return -1; }
 int shm_unlink(const char *name) { (void)name; errno = ENOSYS; return -1; }
 long syscall(long number, ...) { (void)number; errno = ENOSYS; return -1; }
-int IsAddrElfOrFileMapped(uintptr_t addr) { (void)addr; return 0; }
+
+/* Loaded guest code segments registered by nx_x64_mark_code so BIGBLOCK=2 joins blocks across branches. */
+enum { NX_CODE_RANGE_MAX = 32 };
+static struct { uintptr_t start, end; } g_code_ranges[NX_CODE_RANGE_MAX];
+static int g_code_range_count;
+void nx_x64_register_code_range(uintptr_t start, size_t size) {
+    if (!size) return;
+    int idx = __atomic_fetch_add(&g_code_range_count, 1, __ATOMIC_RELAXED);
+    if (idx < NX_CODE_RANGE_MAX) {
+        g_code_ranges[idx].start = start;
+        g_code_ranges[idx].end = start + size;
+    }
+}
+int IsAddrElfOrFileMapped(uintptr_t addr) {
+    int n = __atomic_load_n(&g_code_range_count, __ATOMIC_ACQUIRE);
+    if (n > NX_CODE_RANGE_MAX) n = NX_CODE_RANGE_MAX;
+    for (int i = 0; i < n; ++i) {
+        if (addr >= g_code_ranges[i].start && addr < g_code_ranges[i].end) return 1;
+    }
+    return 0;
+}
 
 /* Box64 brackets allocator updates with these to stay consistent if a signal lands inside. */
 static RMutex critical;

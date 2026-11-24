@@ -5,13 +5,12 @@
 
 #include <array>
 #include <limits>
-#include <map>
 #include <memory>
 #include <optional>
 #include <tuple>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <tsl/robin_map.h>
 #include "shader_recompiler/backend/glsl/emit_glsl.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -70,11 +69,53 @@ public:
     Shader::Info* GetCompute(const AmdGpu::ComputeProgram& program);
 
 private:
-    using Programs = std::unordered_map<u64, std::vector<std::unique_ptr<StageModule>>>;
+    using Programs = tsl::robin_map<u64, std::vector<std::unique_ptr<StageModule>>>;
+
+    struct VsRuntimeKey {
+        u32 common{};
+        u32 clipper{};
+        u32 vs_output_control{};
+        u32 step_rate_0{};
+        u32 step_rate_1{};
+        bool tess_emulated{};
+    };
+
+    struct FsRuntimeKey {
+        u32 common{};
+        AmdGpu::PsInput en_flags{};
+        AmdGpu::PsInput addr_flags{};
+        u8 num_interp{};
+        u8 front_face_all_bits{};
+        u8 num_samples{1};
+        u8 mrtz_mask{};
+        u8 active_cb_mask{};
+        bool dual_source_blending{};
+        AmdGpu::ShaderExportFormat z_export_format{};
+        std::array<u16, 32> ps_inputs{};
+        std::array<Shader::PsColorBuffer, Shader::MaxColorBuffers> color_buffers{};
+    };
+
+    struct FastGraphicsSlot {
+        const u32* vs_code{};
+        const u32* ps_code{};
+        u64 vs_hash{};
+        u64 ps_hash{};
+        Shader::Backend::GLSL::PrimitiveExpansion expansion{};
+        GraphicsProgram* program{};
+        VsRuntimeKey vs_key{};
+        FsRuntimeKey fs_key{};
+    };
+
+    static constexpr u32 FastSlotCount = 64;
+
+    static void FillVsRuntimeKey(const AmdGpu::Regs& regs, VsRuntimeKey& key);
+    static bool MatchesVsRuntimeKey(const AmdGpu::Regs& regs, const VsRuntimeKey& key);
+    static void FillFsRuntimeKey(const AmdGpu::Regs& regs, FsRuntimeKey& key);
+    static bool MatchesFsRuntimeKey(const AmdGpu::Regs& regs, const FsRuntimeKey& key);
 
     StageModule* GetModule(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                            const Shader::ShaderParams& params,
-                           Shader::RuntimeInfo runtime_info);
+                           const Shader::RuntimeInfo& runtime_info);
     Shader::RuntimeInfo BuildRuntimeInfo(const AmdGpu::Regs& regs, Shader::HwStage hw_stage,
                                          Shader::SwStage sw_stage) const;
     GraphicsProgram* Link(StageModule* vertex, StageModule* fragment,
@@ -86,9 +127,18 @@ private:
     Shader::Profile profile{};
     Shader::Pools pools;
     Programs programs;
+    std::array<FastGraphicsSlot, FastSlotCount> fast_graphics{};
     using ProgramKey =
         std::tuple<StageModule*, StageModule*, Shader::Backend::GLSL::PrimitiveExpansion>;
-    std::map<ProgramKey, std::unique_ptr<GraphicsProgram>> graphics;
+    struct ProgramKeyHash {
+        size_t operator()(const ProgramKey& key) const {
+            const u64 a = reinterpret_cast<uintptr_t>(std::get<0>(key));
+            const u64 b = reinterpret_cast<uintptr_t>(std::get<1>(key));
+            const u64 c = static_cast<u64>(std::get<2>(key));
+            return size_t(a ^ (b * 0x9E3779B97F4A7C15ULL) ^ (c * 0xBF58476D1CE4E5B9ULL));
+        }
+    };
+    tsl::robin_map<ProgramKey, std::unique_ptr<GraphicsProgram>, ProgramKeyHash> graphics;
     std::unordered_set<u64> reported;
 };
 

@@ -8,6 +8,7 @@
 /build/
 /build-nx/
 /dist/
+/dist-nx/
 /out/
 
 # Local tooling
@@ -39,6 +40,8 @@ eboot.bin
 /third_party/trg-launcher/
 # Box64 (MIT), cloned for the Switch x86-64 dynarec: git clone --depth 1 https://github.com/ptitSeb/box64 third_party/box64
 /third_party/box64/
+# Mesa Switch OpenGL/GLES SDK built for Switch
+/third_party/mesa-switch/
 
 # Video core dependencies fetched by tools\build.ps1 (gpu\deps.txt); sirit, gcn, half and fonts are vendored
 /gpu/third_party/imgui/

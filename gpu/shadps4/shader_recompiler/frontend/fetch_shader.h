@@ -78,6 +78,8 @@ private:
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
+/// Returns cached fetch shader data without copying; pointer holds until next ParseFetchShader* call on this thread.
+const FetchShaderData* ParseFetchShaderPtr(const Shader::Info& info);
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
 } // namespace Shader::Gcn

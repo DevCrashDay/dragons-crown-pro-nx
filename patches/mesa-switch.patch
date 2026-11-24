@@ -1,0 +1,95 @@
+Mesa Switch patch over danfromtico/mesa-switch (0ff5207).
+Apply: git -C third_party/mesa-switch apply ../../patches/mesa-switch.patch
+
+diff --git a/src/nouveau/horizon/nouveau_horizon_private.h b/src/nouveau/horizon/nouveau_horizon_private.h
+index 12701cd..9d097fe 100644
+--- a/src/nouveau/horizon/nouveau_horizon_private.h
++++ b/src/nouveau/horizon/nouveau_horizon_private.h
+@@ -166,6 +166,7 @@ struct nouveau_horizon_va {
+    uint32_t flags;
+    bool has_pte_kind;
+    uint8_t pte_kind;
++   bool in_va_heap;
+    bool quarantined;
+ };
+ 
+diff --git a/src/nouveau/horizon/nouveau_horizon_vm.c b/src/nouveau/horizon/nouveau_horizon_vm.c
+index 307526c..e2ecb57 100644
+--- a/src/nouveau/horizon/nouveau_horizon_vm.c
++++ b/src/nouveau/horizon/nouveau_horizon_vm.c
+@@ -170,6 +170,7 @@ nouveau_horizon_va_create(
+       return NOUVEAU_HORIZON_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
++   Result rc = 0;
+    simple_mtx_lock(&device->va_mutex);
+    if (create_info->flags & NOUVEAU_HORIZON_VA_FIXED) {
+       if (!util_vma_heap_alloc_addr(&device->va_heap,
+@@ -180,28 +181,48 @@ nouveau_horizon_va_create(
+          return NOUVEAU_HORIZON_ERROR_BUSY;
+       }
+       va->addr = create_info->fixed_addr;
++      va->in_va_heap = true;
++      rc = nvAddressSpaceAllocFixed(
++         &device->addr_space,
++         (create_info->flags & NOUVEAU_HORIZON_VA_SPARSE) != 0,
++         size_B, va->addr);
+    } else {
+-      va->addr = util_vma_heap_alloc(&device->va_heap, size_B, align_B);
+-      if (va->addr == 0) {
++      /* Let Horizon kernel AllocSpace place non-fixed VAs instead of
++       * AllocFixed from the top of the VA heap (avoids emulator AllocFixed bugs
++       * while preserving alignment and tracking in va_heap when in range).
++       */
++      const uint64_t pages64 = size_B / device->page_size_B;
++      if (size_B % device->page_size_B != 0 || pages64 > UINT32_MAX) {
+          simple_mtx_unlock(&device->va_mutex);
+          nouveau_horizon_va_record_create_failure(device);
+          FREE(va);
+          return NOUVEAU_HORIZON_ERROR_OUT_OF_DEVICE_MEMORY;
+       }
++      const uint32_t alloc_flags =
++         (create_info->flags & NOUVEAU_HORIZON_VA_SPARSE) != 0 ?
++            NvAllocSpaceFlags_Sparse : 0;
++      rc = nvioctlNvhostAsGpu_AllocSpace(
++         device->addr_space.fd, (uint32_t)pages64, device->page_size_B,
++         alloc_flags, align_B, &va->addr);
++      if (R_SUCCEEDED(rc) &&
++          va->addr >= device->va_start &&
++          va->addr <= device->va_end &&
++          size_B <= device->va_end - va->addr) {
++         va->in_va_heap =
++            util_vma_heap_alloc_addr(&device->va_heap, va->addr, size_B);
++      }
+    }
+ 
+-   Result rc = nvAddressSpaceAllocFixed(
+-      &device->addr_space,
+-      (create_info->flags & NOUVEAU_HORIZON_VA_SPARSE) != 0,
+-      size_B, va->addr);
+    if (R_FAILED(rc)) {
+       nouveau_horizon_va_record_create_failure(device);
+-      util_vma_heap_free(&device->va_heap, va->addr, size_B);
++      if (va->in_va_heap)
++         util_vma_heap_free(&device->va_heap, va->addr, size_B);
+       simple_mtx_unlock(&device->va_mutex);
+       nouveau_horizon_log(
+          device, NOUVEAU_HORIZON_LOG_ERROR,
+-         "nvAddressSpaceAllocFixed(addr=0x%" PRIx64
+-         ", size=0x%" PRIx64 ") failed: 0x%x",
++         "%s(addr=0x%" PRIx64 ", size=0x%" PRIx64 ") failed: 0x%x",
++         (create_info->flags & NOUVEAU_HORIZON_VA_FIXED) ?
++            "nvAddressSpaceAllocFixed" : "AllocSpace",
+          va->addr, size_B, R_VALUE(rc));
+       FREE(va);
+       return nouveau_horizon_status_from_result(
+@@ -284,7 +305,8 @@ nouveau_horizon_va_put(struct nouveau_horizon_va *va)
+       simple_mtx_unlock(&va->mutex);
+       return;
+    }
+-   util_vma_heap_free(&device->va_heap, va->addr, va->size_B);
++   if (va->in_va_heap)
++      util_vma_heap_free(&device->va_heap, va->addr, va->size_B);
+    simple_mtx_unlock(&device->va_mutex);
+    simple_mtx_unlock(&va->mutex);
+ 

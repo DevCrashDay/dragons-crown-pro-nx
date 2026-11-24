@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "dcp_toggles.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -377,6 +378,7 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    DcpStats::WaitTimer wait_timer{DcpStats::vblank_wait_ns};
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });

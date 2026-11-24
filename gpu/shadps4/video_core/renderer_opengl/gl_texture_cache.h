@@ -75,7 +75,8 @@ public:
     /// Any thread: guest memory went away; the images over it die on the GPU thread.
     void QueueUnmap(VAddr address, u64 size);
     /// A write made on the GPU's behalf, in order with the draws.
-    void NoteGpuWrite(VAddr address, u64 size);
+    /// `cleared` already holds the new content (a GL clear): not re-uploaded.
+    void NoteGpuWrite(VAddr address, u64 size, const Image* cleared = nullptr);
     void NextFrame();
 
     /// Called before an image's texture is deleted (framebuffers refer to it).

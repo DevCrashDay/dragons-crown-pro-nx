@@ -265,6 +265,9 @@ extern "C" int dcpgpu_init(const DcpGpuConfig* config) {
         runtime_log_finalize();
         runtime_log_flush();
         dcp_startup_phase("process exit");
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        nx_platform_quit();
+#endif
         std::_Exit(0);
     };
 #ifdef DCP_SWITCH_OPENGL_ONLY

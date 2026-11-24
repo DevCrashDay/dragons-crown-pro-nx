@@ -25,9 +25,15 @@ namespace DcpOptions {
 inline constexpr int kKey = SDL_SCANCODE_F1;
 inline constexpr char kTitle[] = "OPTIONS";
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+enum class Page { Switch, Display, Graphics, Gameplay, Online, Controls, Cheats };
+inline constexpr std::array kPages{Page::Switch, Page::Display, Page::Graphics, Page::Gameplay,
+                                   Page::Online, Page::Controls, Page::Cheats};
+#else
 enum class Page { Display, Graphics, Gameplay, Online, Controls, Cheats };
 inline constexpr std::array kPages{Page::Display, Page::Graphics, Page::Gameplay,
                                    Page::Online,  Page::Controls, Page::Cheats};
+#endif
 
 struct PageList {
     std::array<Page, kPages.size()> pages{};
@@ -63,6 +69,9 @@ constexpr int RecoverPage(const PageList& list, Page selected) {
 
 constexpr const char* PageName(Page page) {
     switch (page) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    case Page::Switch: return "Switch";
+#endif
     case Page::Display: return "Display";
     case Page::Graphics: return "Graphics";
     case Page::Gameplay: return "Gameplay";
@@ -75,6 +84,10 @@ constexpr const char* PageName(Page page) {
 
 constexpr const char* PageNote(Page page) {
     switch (page) {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    case Page::Switch:
+        return "Saves to sdmc:/switch/dragons_crown_pro/nx.ini right away. Live changes apply immediately.";
+#endif
     case Page::Display:
         return "Window size, Monitor and Graphics card are launcher-only: change them before pressing Play.";
     case Page::Graphics:
@@ -274,14 +287,70 @@ constexpr bool SettingsInOrder() {
 }
 static_assert(SettingsInOrder());
 
-inline int ChoiceIndex(const Setting& setting, std::string_view value) {
-    for (size_t i = 0; i < setting.choices.size(); ++i) {
-        if (setting.choices[i].value == value) {
+inline int ChoiceIndex(std::span<const Choice> choices, std::string_view value) {
+    for (size_t i = 0; i < choices.size(); ++i) {
+        if (choices[i].value == value) {
             return int(i);
         }
     }
     return -1;
 }
+
+inline int ChoiceIndex(const Setting& setting, std::string_view value) {
+    return ChoiceIndex(setting.choices, value);
+}
+
+#ifdef DCP_SWITCH_OPENGL_ONLY
+struct NxSetting {
+    const char* env_key;
+    const char* label;
+    const char* help;
+    Apply apply;
+    std::span<const Choice> choices;
+};
+
+inline constexpr Choice kNxSafeChoices[] = {{"1", "Safe"}, {"0", "Performance"}};
+inline constexpr Choice kNxGlModeChoices[] = {{"core", "Desktop GL"}, {"gles", "GLES 3.2"}};
+inline constexpr Choice kNxAudioChoices[] = {{"sdl", "On"}, {"none", "Off"}};
+inline constexpr Choice kNxBoostChoices[] = {{"1", "Boosted"}, {"0", "Stock"}};
+inline constexpr Choice kNxPadMapChoices[] = {
+    {"", "Default"},
+    {"cross=b,circle=a", "Swap A / B"},
+    {"cross=b,circle=a,square=y,triangle=x", "Swap A/B + X/Y"},
+};
+inline constexpr Choice kNxSchedChoices[] = {{"spread", "Spread"}, {"mapped", "Mapped"}, {"off", "Off"}};
+inline constexpr Choice kNxGpuThreadChoices[] = {
+    {"", "Default (48)"}, {"44:2", "High (44:2)"}, {"59:2", "Shared (59:2)"}, {"off", "Off"}};
+inline constexpr Choice kNxRingChoices[] = {{"1", "On"}, {"0", "Off"}};
+inline constexpr Choice kNxFrameDumpChoices[] = {{"0", "Off"}, {"300", "300f"}, {"600", "600f"}};
+
+inline constexpr std::array<NxSetting, 12> kNxSettings{{
+    {"NX_SAFE", "Boot mode", "Performance enables faster ARM64/dynarec hooks. Safe disables them.",
+     Apply::Restart, kNxSafeChoices},
+    {"VSYNC", "V-Sync", "Paces OpenGL swap to display VSync. Off avoids frame-pacing sawtooth stalls.",
+     Apply::Live, kOffOn},
+    {"NX_BOOST", "CPU / GPU boost", "Overclocks CPU (1785 MHz), GPU and EMC for smoother framerate.",
+     Apply::Live, kNxBoostChoices},
+    {"PAD_MAP", "Face buttons", "Remaps Switch face buttons to PS4 Cross/Circle/Square/Triangle.",
+     Apply::Live, kNxPadMapChoices},
+    {"GL_MODE", "OpenGL backend", "GLES 3.2 uses the lighter client/ES shader path for faster frames.",
+     Apply::Restart, kNxGlModeChoices},
+    {"AUDIO", "Audio output", "Disables Switch audio output for headless or silent testing.",
+     Apply::Restart, kNxAudioChoices},
+    {"NX_SCHED", "Thread scheduler", "Controls how emulated threads share Switch cores 0-2 and priorities.",
+     Apply::Restart, kNxSchedChoices},
+    {"NX_GPU_THREAD", "GPU thread", "Priority and core pinning for GpuCommandProcessor.",
+     Apply::Restart, kNxGpuThreadChoices},
+    {"NX_PERSISTENT_RING", "Persistent ring", "Keep vertex/uniform buffers mapped to skip CPU scans.",
+     Apply::Restart, kNxRingChoices},
+    {"FRAME_DUMP", "Frame dumps", "Saves BMP screenshots under logs/ at intervals.",
+     Apply::Live, kNxFrameDumpChoices},
+    {"STALL_DUMP", "Thread stall log", "Logs long HLE bridge stalls under logs/.",
+     Apply::Restart, kOffOn},
+    {"GL_DEBUG", "GL debug log", "Requests a synchronous OpenGL debug callback on init.",
+     Apply::Restart, kOffOn},
+}};
+#endif
 
 inline std::string Current(const DcpSettings::Values& v, Id id) {
     const auto flag = [](bool on) { return std::string(on ? "1" : "0"); };

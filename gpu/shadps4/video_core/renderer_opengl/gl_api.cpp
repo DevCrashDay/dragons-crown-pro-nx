@@ -11,7 +11,10 @@ namespace {
 bool AbsentFromGles(std::string_view name) {
     for (const std::string_view absent :
          {"glDepthRange", "glLogicOp", "glPolygonMode", "glTexImage1D", "glTexSubImage1D",
-          "glPrimitiveRestartIndex", "glProvokingVertex", "glTexBuffer",
+          "glPrimitiveRestartIndex", "glProvokingVertex",
+#ifndef __SWITCH__
+          "glTexBuffer",
+#endif
           "glDrawElementsInstancedBaseVertex", "glEnablei", "glDisablei", "glColorMaski"}) {
         if (name == absent) {
             return true;
@@ -73,6 +76,10 @@ bool Load(std::string& missing, bool gles) {
             SDL_GL_GetProcAddress("glProvokingVertexANGLE"));
         PolygonMode = reinterpret_cast<decltype(PolygonMode)>(
             SDL_GL_GetProcAddress("glPolygonModeANGLE"));
+#ifdef __SWITCH__
+        // EXT_buffer_storage: persistent stream rings on Mesa's GLES.
+        ResolveSuffixed(BufferStorage, "glBufferStorage");
+#endif
     }
     return true;
 }

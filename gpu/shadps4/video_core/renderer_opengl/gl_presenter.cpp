@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "dcp_present.h"
 #include "dcp_renderer.h"
 #include "dcp_settings.h"
+#include "dcp_toggles.h"
 #include "dcp_ultrawide_sides.h"
 #include "sdl_window.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -32,6 +34,7 @@ extern "C" void runtime_log_flush(void);
 extern "C" void nx_platform_trace(const char* format, ...);
 extern "C" void runtime_file_stats(uint64_t* out_reads, uint64_t* out_bytes);
 extern "C" void nx_platform_heap_info(uint64_t* heap_total, uint64_t* heap_free);
+extern "C" int nx_platform_cpu_report_str(char* buf, size_t size);
 extern "C" void nx_large_arena_stats(uint64_t* used_bytes, uint64_t* free_bytes, uint64_t* largest_free, int* nalloc, int* nfree);
 #endif
 
@@ -195,6 +198,12 @@ Capabilities QueryGlesCapabilities() {
     capabilities.norm16 = HasExtension("GL_EXT_texture_norm16");
     capabilities.anisotropy = HasExtension("GL_EXT_texture_filter_anisotropic");
     capabilities.depth_clamp = HasExtension("GL_EXT_depth_clamp");
+#ifdef __SWITCH__
+    // nx.ini NX_PERSISTENT_RING=0 keeps the per-draw mapped / client-memory rings.
+    const char* persistent = std::getenv("DCP_NX_PERSISTENT_RING");
+    capabilities.buffer_storage = gl::BufferStorage && HasExtension("GL_EXT_buffer_storage") &&
+                                  !(persistent && !std::strcmp(persistent, "0"));
+#endif
     capabilities.draw_buffers_blend =
         gl::Enablei && gl::Disablei && gl::ColorMaski && gl::BlendFuncSeparatei && gl::BlendEquationSeparatei;
     gl::GetIntegerv(GL_MAX_TEXTURE_SIZE, &capabilities.max_texture_size);
@@ -335,7 +344,12 @@ void Presenter::CreatePasses() {
 }
 
 void Presenter::ApplySwapInterval() {
-    const int wanted = DcpSettings::Get().vsync ? 1 : 0;
+    int wanted = DcpSettings::Get().vsync ? 1 : 0;
+#ifdef __SWITCH__
+    if (const char* env_vsync = std::getenv("DCP_VSYNC"); env_vsync && *env_vsync) {
+        wanted = std::atoi(env_vsync) != 0 ? 1 : 0;
+    }
+#endif
     if (wanted != swap_interval) {
         swap_interval = wanted;
         SDL_GL_SetSwapInterval(wanted);
@@ -344,6 +358,9 @@ void Presenter::ApplySwapInterval() {
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+#ifdef __SWITCH__
+    NxProfScope prof{g_nx_prof.present};
+#endif
     rasterizer->OnFlip();
     Image* image = rasterizer->GetTextureCache().FindDisplayBuffer(attribute, cpu_address);
     if (!image) {
@@ -417,6 +434,9 @@ void Presenter::Present(VideoCore::PresentFrame* present_frame, bool, bool is_ga
 }
 
 void Presenter::Show(const Frame& frame, bool is_game_frame) {
+#ifdef __SWITCH__
+    NxProfScope prof{g_nx_prof.present};
+#endif
     static u32 shown_count = 0;
     static bool first_game_frame_logged = false;
     ++shown_count;
@@ -424,7 +444,7 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
     if (first_game) {
         first_game_frame_logged = true;
     }
-    if (shown_count == 1 || (shown_count % 60) == 0 || first_game) {
+    if (shown_count == 1 || first_game) {
 #ifdef __SWITCH__
         nx_platform_trace("Presenter: frame %u (%ux%u, blank=%d, game=%d)\n",
                           shown_count, frame.width, frame.height, frame.blank ? 1 : 0, is_game_frame ? 1 : 0);
@@ -490,9 +510,16 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
     if (shown_count == 1 || (shown_count % 60) == 0 || first_game || traced_now) {
         using ReadPixelsFn = void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
         static auto read_px = reinterpret_cast<ReadPixelsFn>(SDL_GL_GetProcAddress("glReadPixels"));
-        u8 max_rgb = 0;
-        u8 px[4] = {0, 0, 0, 0};
-        if (read_px) {
+        const char* dump_env = std::getenv("DCP_FRAME_DUMP");
+        const int dump_every = dump_env ? std::atoi(dump_env) : 0;
+        static bool seen_nonblack = false;
+        static u8 last_max = 0;
+        static u8 last_px[4] = {0, 0, 0, 0};
+        const bool dumping = traced_now || (dump_every > 0 && shown_count % unsigned(dump_every) == 0);
+        // Probe pixels until first non-black game output is observed; after that only read back when tracing/dumping.
+        if (read_px && (!seen_nonblack || first_game || dumping)) {
+            u8 probe_max = 0;
+            u8 probe_px[4] = {0, 0, 0, 0};
             const int pts[5][2] = {{window_width / 2, window_height / 2},
                                    {window_width / 4, window_height / 2},
                                    {window_width * 3 / 4, window_height / 2},
@@ -501,16 +528,19 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
             for (int i = 0; i < 5; ++i) {
                 u8 p[4] = {0, 0, 0, 0};
                 read_px(pts[i][0], pts[i][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
-                if (i == 0) std::memcpy(px, p, 4);
-                max_rgb = std::max({max_rgb, p[0], p[1], p[2]});
+                if (i == 0) std::memcpy(probe_px, p, 4);
+                probe_max = std::max({probe_max, p[0], p[1], p[2]});
+            }
+            std::memcpy(last_px, probe_px, 4);
+            last_max = probe_max;
+            if (probe_max > 0) {
+                seen_nonblack = true;
             }
         }
+        const u8 max_rgb = last_max;
+        const u8 (&px)[4] = last_px;
         // nx.ini FRAME_DUMP=N: every N-th presented frame as a quarter-size BMP in logs/.
-        static const int dump_every = [] {
-            const char* e = std::getenv("DCP_FRAME_DUMP");
-            return e ? std::atoi(e) : 0;
-        }();
-        if (read_px && (traced_now || (dump_every > 0 && shown_count % unsigned(dump_every) == 0))) {
+        if (read_px && dumping) {
             const int w = window_width / 4, h = window_height / 4, row = (w * 3 + 3) & ~3;
             // One source row per output row: a whole-frame read needs a large staging copy.
             std::vector<u8> line(size_t(window_width) * 4);
@@ -549,8 +579,38 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
         uint64_t au = 0, af = 0, abig = 0;
         int ana = 0, anf = 0;
         nx_large_arena_stats(&au, &af, &abig, &ana, &anf);
-        nx_platform_trace("Presenter: show #%u win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) center=(%u,%u,%u) max=%u glErr=0x%x(%u) heap_free=%lluMiB arena=%llu/%lluMiB(big=%lluMiB)\n",
-                          shown_count, window_width, window_height,
+        static auto last_t = std::chrono::steady_clock::now();
+        static u32 last_shown = 0;
+        const auto now_t = std::chrono::steady_clock::now();
+        const double dt_s = std::chrono::duration<double>(now_t - last_t).count();
+        const u32 df = shown_count > last_shown ? (shown_count - last_shown) : 1;
+        const double fps = (shown_count > last_shown && dt_s > 0.001) ? double(df) / dt_s : 0.0;
+        last_t = now_t;
+        last_shown = shown_count;
+        const double to_ms = 1.0 / (19200.0 * double(df)); // 19.2 MHz cntpct_el0
+        const double p_draw = double(g_nx_prof.draw.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_ref = double(g_nx_prof.refresh.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_gl = double(g_nx_prof.gl_draw.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_swap = double(g_nx_prof.swap.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_shd = double(g_nx_prof.shd.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_tgt = double(g_nx_prof.tgt.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_stg = double(g_nx_prof.stg.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_vtx = double(g_nx_prof.vtx.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_cmt = double(g_nx_prof.cmt.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double p_st = double(g_nx_prof.st.exchange(0, std::memory_order_relaxed)) * to_ms;
+        // GPU thread waiting on the guest's next submit / on the flip-done label (vblank tick).
+        const double p_idle = double(DcpStats::gpu_idle_ns.exchange(0, std::memory_order_relaxed)) / 1e6 / double(df);
+        const double p_vo = double(DcpStats::vo_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6 / double(df);
+        const double p_cs = double(g_nx_prof.cs.exchange(0, std::memory_order_relaxed)) * to_ms;
+        const double n_cs = double(g_nx_prof.cs_count.exchange(0, std::memory_order_relaxed)) / double(df);
+        // Present work without the swap; guest time blocked on the GPU and on vblank.
+        const double p_pres = double(g_nx_prof.present.exchange(0, std::memory_order_relaxed)) * to_ms - p_swap;
+        const double p_gw = double(DcpStats::guest_gpu_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6 / double(df);
+        const double p_vbw = double(DcpStats::vblank_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6 / double(df);
+        char cpu_line[512];
+        const bool has_cpu = nx_platform_cpu_report_str(cpu_line, sizeof cpu_line) != 0;
+        nx_platform_trace("Presenter: show #%u fps=%.1f (tot=%.1f draw=%.1f[shd=%.1f tgt=%.1f stg=%.1f vtx=%.1f cmt=%.1f st=%.1f ref=%.1f gl=%.1f] cs=%.1f(%.0f) pres=%.1f swap=%.1f idle=%.1f vo=%.1f | guest gw=%.1f vbw=%.1f heal=%llu sets=%llu resets=%llu idles=%llu) win=%dx%d draws=%llu/%llu reads=%llu (%llu KiB) center=(%u,%u,%u) max=%u glErr=0x%x(%u) heap_free=%lluMiB arena=%llu/%lluMiB(big=%lluMiB)\n%s%s",
+                          shown_count, fps, (dt_s * 1000.0) / double(df), p_draw, p_shd, p_tgt, p_stg, p_vtx, p_cmt, p_st, p_ref, p_gl, p_cs, n_cs, p_pres, p_swap, p_idle, p_vo, p_gw, p_vbw, static_cast<unsigned long long>(DcpStats::lock_heals.exchange(0)), static_cast<unsigned long long>(DcpStats::lock_sets.exchange(0)), static_cast<unsigned long long>(DcpStats::lock_resets.exchange(0)), static_cast<unsigned long long>(DcpStats::gpu_idle_signals.exchange(0)), window_width, window_height,
                           static_cast<unsigned long long>(rasterizer->DrawsReachingGl()),
                           static_cast<unsigned long long>(rasterizer->Draws()),
                           static_cast<unsigned long long>(f_reads),
@@ -559,13 +619,20 @@ void Presenter::Show(const Frame& frame, bool is_game_frame) {
                           static_cast<unsigned long long>(heap_free >> 20),
                           static_cast<unsigned long long>(au >> 20),
                           static_cast<unsigned long long>((au + af) >> 20),
-                          static_cast<unsigned long long>(abig >> 20));
+                          static_cast<unsigned long long>(abig >> 20),
+                          has_cpu ? cpu_line : "", has_cpu ? "\n" : "");
     }
     if (trace_frame > 0 && shown_count + 1 == trace_frame) {
         rasterizer->BeginDrawTrace("sdmc:/switch/dragons_crown_pro/logs/draw_trace.txt", trace_frame);
     }
 #endif
+#ifdef __SWITCH__
+    const u64 sw_t0 = NxTick();
+#endif
     const bool swapped = SDL_GL_SwapWindow(window.GetSDLWindow());
+#ifdef __SWITCH__
+    g_nx_prof.swap.fetch_add(NxTick() - sw_t0, std::memory_order_relaxed);
+#endif
     if (gles) {
         CheckSwap(swapped);
     }

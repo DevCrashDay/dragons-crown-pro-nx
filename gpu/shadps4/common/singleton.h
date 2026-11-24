@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 namespace Common {
 
@@ -11,9 +12,7 @@ template <class T>
 class Singleton {
 public:
     static T* Instance() {
-        if (!m_instance) {
-            m_instance = std::make_unique<T>();
-        }
+        std::call_once(m_once, [] { m_instance = std::make_unique<T>(); });
         return m_instance.get();
     }
 
@@ -23,6 +22,7 @@ protected:
 
 private:
     static inline std::unique_ptr<T> m_instance{};
+    static inline std::once_flag m_once{};
 };
 
 } // namespace Common

@@ -28,6 +28,21 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef __SWITCH__
+extern "C" void nx_platform_host_thread_setup(const char* name, const char* key);
+extern "C" volatile const char* nx_gpu_phase;
+extern "C" volatile u64 nx_gpu_arg, nx_gpu_tick;
+// STALL_DUMP shows the GPU command thread's last phase: one store per packet.
+static inline void NxGpuPhase(const char* phase, u64 arg) {
+    u64 tick;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(tick));
+    nx_gpu_arg = arg;
+    nx_gpu_tick = tick;
+    nx_gpu_phase = phase;
+}
+#else
+static inline void NxGpuPhase(const char*, u64) {}
+#endif
 
 namespace AmdGpu {
 
@@ -99,12 +114,16 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        NxGpuPhase("command", 0); // presenter Show/PrepareFrame, texture work sent from other threads
         callback();
     }
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifdef __SWITCH__
+    nx_platform_host_thread_setup("GpuCommandProcessor", "GPU_THREAD");
+#endif
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         DcpStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -120,9 +139,19 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             const auto idle_start = std::chrono::steady_clock::now();
+            NxGpuPhase("idle", 0);
             std::unique_lock lk{submit_mutex};
+#ifdef __SWITCH__
+            // dcp: a lost notify (seen under Ryujinx) left submit_done unprocessed, so GpuIdle
+            // never fired and the guest waited on its submission lock: re-check every 5 ms.
+            while (!stoken.stop_requested() &&
+                   !submit_cv.wait_for(lk, stoken, std::chrono::milliseconds(5),
+                                       [this] { return num_commands || num_submits || submit_done; })) {
+            }
+#else
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
+#endif
             DcpStats::gpu_idle_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - idle_start).count(),
@@ -165,6 +194,7 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+        NxGpuPhase("submit_end", 0);
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
@@ -192,6 +222,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 work_retired = true;
             }
         }
+        DcpStats::gpu_idle_signals.fetch_add(1, std::memory_order_relaxed);
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -745,6 +776,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            NxGpuPhase("pm4", static_cast<u64>(opcode));
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
@@ -1226,6 +1258,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
+                    DcpStats::WaitTimer vo_timer{DcpStats::vo_wait_ns};
+                    NxGpuPhase("vo_label", reinterpret_cast<u64>(wait_addr));
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
@@ -1240,6 +1274,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                NxGpuPhase("wait_reg_mem", wait_reg_mem->Address<VAddr>());
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));

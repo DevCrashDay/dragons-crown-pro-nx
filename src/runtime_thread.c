@@ -24,6 +24,7 @@
 #include <windows.h>
 #elif defined(__SWITCH__)
 #include <sys/mman.h>
+#include <switch.h>
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
@@ -342,6 +343,7 @@ static void *host_start(void *p) {
     g_nx_guest_worker_id = 0;
     extern void nx_hle_thread_end(void);
     nx_hle_thread_end();
+    nx_platform_thread_exit();
 #else
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
 #endif
@@ -477,7 +479,26 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }
-static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
+static ABI int32_t thread_yield(void) {
+#ifdef __SWITCH__
+    /* RenderDLThread polls scePthreadYield up to ~1.6M/s; back off gently on sustained rapid yields. */
+    static __thread uint64_t last_tick;
+    static __thread uint32_t streak;
+    const uint64_t now = armGetSystemTick();
+    if (last_tick && (now - last_tick) < 9600) {
+        if (streak < 128) ++streak;
+    } else {
+        streak = 0;
+    }
+    last_tick = now;
+    if (streak < 16) svcSleepThread(0);
+    else if (streak < 48) svcSleepThread(10000);
+    else svcSleepThread(50000);
+#else
+    sched_yield();
+#endif
+    return 0;
+}
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
     if (!find_thread(t)) return ERR(3);
     if (!prio) return ERR(22);

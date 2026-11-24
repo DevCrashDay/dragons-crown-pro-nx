@@ -25,6 +25,7 @@
 #include "dcp_touch_route.h"
 #include "dcp_touchscreen.h"
 #include "runtime_online_overlay.h"
+#include "runtime_pad_rumble.h"
 #ifdef _WIN32
 #include "video_core/renderer_opengl/gl_angle.h"
 #endif
@@ -504,6 +505,7 @@ bool WindowSDL::PollEvents() {
     RefreshTitle();
     DcpOverlay::SetDisplayScale(SDL_GetWindowDisplayScale(window));
     cursor.SetMouseControls(dcp_mouse_enabled(dcp_mouse_global()) != 0);
+    runtime_pad_pump_inject();
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (DcpLatencyTrace::enabled) {

@@ -1483,6 +1483,15 @@ private:
             out += fmt::format("uniform uvec4 {}ud[4];\n", prefix);
         }
         if (uses_buffers) {
+#ifdef __SWITCH__
+            out += Gles() ? "uniform highp usamplerBuffer dcp_ring;\n"
+                          : "uniform usamplerBuffer dcp_ring;\n";
+            out += fmt::format("uniform uvec2 {}buffers[{}];\n", prefix,
+                               std::max<size_t>(info.buffers.size(), 1));
+            out += fmt::format("uint {0}load(int s,uint i){{return i<{0}buffers[s].y?"
+                               "texelFetch(dcp_ring,int({0}buffers[s].x+i)).r:0u;}}\n",
+                               prefix);
+#else
             out += Gles() ? "uniform highp usampler2D dcp_ring;\n" : "uniform usamplerBuffer dcp_ring;\n";
             out += fmt::format("uniform uvec2 {}buffers[{}];\n", prefix,
                                std::max<size_t>(info.buffers.size(), 1));
@@ -1496,6 +1505,7 @@ private:
                                    "texelFetch(dcp_ring,int({0}buffers[s].x+i)).r:0u;}}\n",
                                    prefix);
             }
+#endif
         }
         if (info.sw_stage == SwStage::Vertex) {
             if (uses_transform) {
@@ -1674,7 +1684,11 @@ std::string GeometrySource(const Stage& vertex, const Stage* fragment,
 
 // A sampler has no default precision in GLSL ES, so every kind the emitter can name is listed.
 std::string GlesHeader(bool noperspective, bool clip_distances, bool dual_source) {
+#ifdef __SWITCH__
+    std::string out = "#version 320 es\n";
+#else
     std::string out = "#version 300 es\n";
+#endif
     if (noperspective) {
         out += "#extension GL_NV_shader_noperspective_interpolation : require\n";
     }
@@ -1688,7 +1702,11 @@ std::string GlesHeader(bool noperspective, bool clip_distances, bool dual_source
     for (const char* sampler :
          {"sampler2D", "sampler3D", "sampler2DArray", "sampler2DShadow", "sampler2DArrayShadow",
           "isampler2D", "isampler3D", "isampler2DArray", "usampler2D", "usampler3D",
-          "usampler2DArray"}) {
+          "usampler2DArray"
+#ifdef __SWITCH__
+          , "usamplerBuffer"
+#endif
+         }) {
         out += fmt::format("precision highp {};\n", sampler);
     }
     return out;
@@ -1720,12 +1738,19 @@ std::string RectTableReaders(const Stage& vertex, std::string& inputs) {
         inputs += fmt::format("attr{}={}(dcp_rect_input({},p,g));", input.semantic,
                               RectInputType(input.number_class), slot);
     }
+#ifdef __SWITCH__
+    if (!vertex.uses_ring) {
+        out += "uniform highp usamplerBuffer dcp_ring;\n";
+    }
+    out += "uint dcp_word(uint t){return texelFetch(dcp_ring,int(t)).r;}\n";
+#else
     if (!vertex.uses_ring) {
         out += "uniform highp usampler2D dcp_ring;\n";
     }
     out += fmt::format("uint dcp_word(uint t){{return texelFetch(dcp_ring,"
                        "ivec2(int(t&{:#x}u),int(t>>{}u)),0).r;}}\n",
                        (1u << RingRowBits) - 1, RingRowBits);
+#endif
     out += "uniform uvec2 vs_rect_draw;\n";
     if (!vertex.vertex_inputs.empty()) {
         out += fmt::format("uniform uvec4 vs_rect_inputs[{}];\n", vertex.vertex_inputs.size());

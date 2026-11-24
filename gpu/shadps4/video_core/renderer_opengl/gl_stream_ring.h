@@ -36,6 +36,10 @@ public:
     void Commit();
     void ForgetGuestCopies();
 
+    [[nodiscard]] u32 CopyGeneration() const {
+        return copy_generation;
+    }
+
     [[nodiscard]] u32 Capacity() const {
         return capacity;
     }

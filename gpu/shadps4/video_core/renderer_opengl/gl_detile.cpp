@@ -282,7 +282,15 @@ void SurfaceTiler::Detile(const u8* tiled, size_t tiled_size, u8* linear, u32 sl
     const u32 element_bytes = num_bits / 8;
     const size_t row_bytes = size_t(pitch) * element_bytes;
     const size_t slice_bytes = row_bytes * height;
-    if (!UsesMicroTileCopies()) {
+    const bool fast_1d =
+        !macro_tiled && thickness == 1 && num_samples == 1 && pitch % MicroTileWidth == 0 &&
+        height % MicroTileHeight == 0 && element_bytes > 0;
+    const bool fast_2d_split =
+        macro_tiled && !UsesMicroTileCopies() && thickness == 1 && num_samples == 1 &&
+        pitch % MicroTileWidth == 0 && height % MicroTileHeight == 0 && element_bytes >= 4 &&
+        micro_tile_bytes <= 1024 && tile_split_bytes >= 256 &&
+        micro_tile_bytes % tile_split_bytes == 0;
+    if (!UsesMicroTileCopies() && !fast_1d && !fast_2d_split) {
         for (u32 slice = 0; slice < slices; ++slice) {
             u8* out = linear + slice_bytes * slice;
             for (u32 y = 0; y < height; ++y) {
@@ -297,28 +305,134 @@ void SurfaceTiler::Detile(const u8* tiled, size_t tiled_size, u8* linear, u32 sl
         }
         return;
     }
+    if (fast_2d_split) {
+        // Pipe interleave is 256 B and tile_bytes = min(micro_tile_bytes, tile_split_bytes) >= 256 B,
+        // so each 256 B chunk (up to 4 chunks for 1024 B BC3/BC7) shares a constant Address base.
+        constexpr u32 ChunkBytes = 1u << NumPipeInterleaveBits;
+        const u32 num_chunks = (micro_tile_bytes + ChunkBytes - 1) / ChunkBytes;
+        struct ElemMap {
+            u8 chunk;
+            u8 chunk_off;
+            u8 lx;
+            u8 ly;
+        };
+        std::array<ElemMap, 64> elem_map{};
+        std::array<u8, 4> rep_lx{};
+        std::array<u8, 4> rep_ly{};
+        std::array<bool, 4> have_rep{};
+        for (u32 y = 0; y < MicroTileHeight; ++y) {
+            for (u32 x = 0; x < MicroTileWidth; ++x) {
+                const u32 off_bytes = PixelIndex(x, y, 0) * element_bytes;
+                const u8 chunk = u8(off_bytes >> NumPipeInterleaveBits);
+                const u8 chunk_off = u8(off_bytes & (ChunkBytes - 1));
+                elem_map[y * MicroTileWidth + x] = {chunk, chunk_off, u8(x), u8(y)};
+                if (!have_rep[chunk] && chunk_off == 0) {
+                    rep_lx[chunk] = u8(x);
+                    rep_ly[chunk] = u8(y);
+                    have_rep[chunk] = true;
+                }
+            }
+        }
+        std::array<u32, 4> chunk_bases{};
+        auto copy_chunked = [&]<size_t FixedBytes>() {
+            constexpr bool fixed = FixedBytes != 0;
+            const size_t elem_sz = fixed ? FixedBytes : element_bytes;
+            for (u32 slice = 0; slice < slices; ++slice) {
+                u8* out = linear + slice_bytes * slice;
+                for (u32 tile_y = 0; tile_y < height; tile_y += MicroTileHeight) {
+                    for (u32 tile_x = 0; tile_x < pitch; tile_x += MicroTileWidth) {
+                        bool all_inside = true;
+                        for (u32 c = 0; c < num_chunks; ++c) {
+                            chunk_bases[c] = Address(tile_x + rep_lx[c], tile_y + rep_ly[c], slice);
+                            if (size_t(chunk_bases[c]) + ChunkBytes > tiled_size) {
+                                all_inside = false;
+                            }
+                        }
+                        u8* tile_out = out + tile_y * row_bytes + size_t(tile_x) * elem_sz;
+                        if (all_inside) {
+                            for (u32 y = 0; y < MicroTileHeight; ++y) {
+                                u8* dst_row = tile_out + y * row_bytes;
+                                for (u32 x = 0; x < MicroTileWidth; ++x) {
+                                    const auto& e = elem_map[y * MicroTileWidth + x];
+                                    std::memcpy(dst_row + x * elem_sz,
+                                                tiled + chunk_bases[e.chunk] + e.chunk_off, elem_sz);
+                                }
+                            }
+                        } else {
+                            for (u32 y = 0; y < MicroTileHeight; ++y) {
+                                u8* dst_row = tile_out + y * row_bytes;
+                                for (u32 x = 0; x < MicroTileWidth; ++x) {
+                                    const auto& e = elem_map[y * MicroTileWidth + x];
+                                    const size_t addr = size_t(chunk_bases[e.chunk]) + e.chunk_off;
+                                    if (addr + elem_sz <= tiled_size) {
+                                        std::memcpy(dst_row + x * elem_sz, tiled + addr, elem_sz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        switch (element_bytes) {
+        case 4:
+            copy_chunked.template operator()<4>();
+            break;
+        case 8:
+            copy_chunked.template operator()<8>();
+            break;
+        case 16:
+            copy_chunked.template operator()<16>();
+            break;
+        default:
+            copy_chunked.template operator()<0>();
+            break;
+        }
+        return;
+    }
     std::array<u32, 64> element_offsets;
     for (u32 y = 0; y < MicroTileHeight; ++y) {
         for (u32 x = 0; x < MicroTileWidth; ++x) {
             element_offsets[y * MicroTileWidth + x] = PixelIndex(x, y, 0) * element_bytes;
         }
     }
-    for (u32 slice = 0; slice < slices; ++slice) {
-        u8* out = linear + slice_bytes * slice;
-        for (u32 tile_y = 0; tile_y < height; tile_y += MicroTileHeight) {
-            for (u32 tile_x = 0; tile_x < pitch; tile_x += MicroTileWidth) {
-                const u32 base = Address(tile_x, tile_y, slice);
-                if (size_t(base) + micro_tile_bytes > tiled_size) {
-                    continue;
-                }
-                u8* tile_out = out + tile_y * row_bytes + size_t(tile_x) * element_bytes;
-                for (u32 i = 0; i < 64; ++i) {
-                    const size_t row = i / MicroTileWidth, column = i % MicroTileWidth;
-                    std::memcpy(tile_out + row * row_bytes + column * element_bytes,
-                                tiled + base + element_offsets[i], element_bytes);
+    auto copy_single = [&]<size_t FixedBytes>() {
+        constexpr bool fixed = FixedBytes != 0;
+        const size_t elem_sz = fixed ? FixedBytes : element_bytes;
+        for (u32 slice = 0; slice < slices; ++slice) {
+            u8* out = linear + slice_bytes * slice;
+            for (u32 tile_y = 0; tile_y < height; tile_y += MicroTileHeight) {
+                for (u32 tile_x = 0; tile_x < pitch; tile_x += MicroTileWidth) {
+                    const u32 base = Address(tile_x, tile_y, slice);
+                    if (size_t(base) + micro_tile_bytes > tiled_size) {
+                        continue;
+                    }
+                    u8* tile_out = out + tile_y * row_bytes + size_t(tile_x) * elem_sz;
+                    const u8* src_base = tiled + base;
+                    for (u32 y = 0; y < MicroTileHeight; ++y) {
+                        u8* dst_row = tile_out + y * row_bytes;
+                        const u32* row_offs = &element_offsets[y * MicroTileWidth];
+                        for (u32 x = 0; x < MicroTileWidth; ++x) {
+                            std::memcpy(dst_row + x * elem_sz, src_base + row_offs[x], elem_sz);
+                        }
+                    }
                 }
             }
         }
+    };
+    switch (element_bytes) {
+    case 4:
+        copy_single.template operator()<4>();
+        break;
+    case 8:
+        copy_single.template operator()<8>();
+        break;
+    case 16:
+        copy_single.template operator()<16>();
+        break;
+    default:
+        copy_single.template operator()<0>();
+        break;
     }
 }
 

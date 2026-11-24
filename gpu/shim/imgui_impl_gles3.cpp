@@ -2,6 +2,9 @@
 
 // The ES3 build of imgui's backend, with its public names changed so it links beside the desktop build.
 #define IMGUI_IMPL_OPENGL_ES3
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#define IMGUI_IMPL_OPENGL_NO_STATE_BACKUP
+#endif
 #define ImGui_ImplOpenGL3_Init ImGuiGles3Backend_Init
 #define ImGui_ImplOpenGL3_InitLoader ImGuiGles3Backend_InitLoader
 #define ImGui_ImplOpenGL3_Shutdown ImGuiGles3Backend_Shutdown

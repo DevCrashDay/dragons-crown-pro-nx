@@ -2,6 +2,8 @@
 #include "dcp_options_ui.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -15,6 +17,9 @@
 #include "dcp_mouse.h"
 #include "runtime_pad_rumble.h"
 #include "boss_battle.h"
+#ifdef DCP_SWITCH_OPENGL_ONLY
+#include "nx/nx_platform.h"
+#endif
 #include "imgui.h"
 
 namespace DcpOptionsUi {
@@ -45,7 +50,7 @@ struct PadChord {
 };
 std::map<uint32_t, PadChord> pad_chords;
 
-enum class Kind { Setting, Cheat, Info, Online };
+enum class Kind { Setting, NxSetting, Cheat, Info, Online };
 
 struct RowRef {
     Kind kind;
@@ -58,13 +63,18 @@ struct Info {
 };
 
 struct State {
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    Page page = Page::Switch;
+#else
     Page page = Page::Display;
+#endif
     int row = 0;
     int first = 0;
     bool focused = false;
     std::string status;
 };
 State state;
+bool nx_restart_pending = false;
 RuntimeOnlinePage online_page;
 std::vector<DcpOptions::OnlineRow> online_rows;
 
@@ -94,6 +104,13 @@ bool Offered(const DcpOptions::Setting& setting) {
 
 std::vector<RowRef> RowsOf(Page page, const CheatRows& cheats) {
     std::vector<RowRef> rows;
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    if (page == Page::Switch) {
+        for (size_t i = 0; i < DcpOptions::kNxSettings.size(); ++i) {
+            rows.push_back({Kind::NxSetting, i});
+        }
+    } else
+#endif
     if (page == Page::Controls) {
         for (const DcpOptions::Setting& setting : DcpOptions::kSettings) {
             if (setting.page == page && Offered(setting)) {
@@ -163,9 +180,62 @@ std::string TranslateOnlineHelp(const std::string& text) {
     return dcp::Tr(text);
 }
 
+#ifdef DCP_SWITCH_OPENGL_ONLY
+std::string NxShown(const DcpOptions::NxSetting& setting) {
+    char var[64];
+    std::snprintf(var, sizeof(var), "DCP_%s", setting.env_key);
+    const char* env = std::getenv(var);
+    if (!env || !*env) {
+        if (std::strcmp(setting.env_key, "VSYNC") == 0) {
+            return DcpSettings::Get().vsync ? "1" : "0";
+        }
+        return std::string(setting.choices[0].value);
+    }
+    return env;
+}
+
+void ChangeNx(const DcpOptions::NxSetting& setting, int direction) {
+    const int idx = DcpOptions::ChoiceIndex(setting.choices, NxShown(setting));
+    const int n = int(setting.choices.size());
+    const int next = idx < 0       ? 0
+                     : direction == 0 ? dcp::menu::NextChoiceWrapping(idx, n)
+                                      : dcp::menu::StepChoice(idx, n, direction);
+    if (next < 0 || next == idx) {
+        return;
+    }
+    const std::string val_str(setting.choices[size_t(next)].value);
+    const char* val = val_str.c_str();
+    if (!nx_platform_save_ini(setting.env_key, val)) {
+        state.status = "Could not save nx.ini.";
+        return;
+    }
+    state.status.clear();
+    if (setting.apply == DcpOptions::Apply::Restart) {
+        nx_restart_pending = true;
+    } else if (std::strcmp(setting.env_key, "VSYNC") == 0) {
+        DcpSettings::Get().vsync = (std::strcmp(val, "0") != 0);
+    } else if (std::strcmp(setting.env_key, "NX_BOOST") == 0) {
+        nx_platform_set_boost(std::strcmp(val, "0") != 0 ? 1 : 0);
+    } else if (std::strcmp(setting.env_key, "PAD_MAP") == 0) {
+        runtime_pad_set_map(val);
+    }
+}
+#endif
+
+std::string FormatSettingValue(std::span<const DcpOptions::Choice> choices, const std::string& shown) {
+    const int index = DcpOptions::ChoiceIndex(choices, shown);
+    return index >= 0
+               ? std::string(kArrowLeft) + "  " + std::string(dcp::Tr(std::string(choices[size_t(index)].label))) +
+                     "  " + kArrowRight
+               : std::string(kArrowLeft) + "  " + shown + "  " + kArrowRight;
+}
+
 std::string Label(const RowRef& row, const CheatRows& cheats) {
     switch (row.kind) {
     case Kind::Setting: return dcp::Tr(DcpOptions::kSettings[row.index].label);
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    case Kind::NxSetting: return dcp::Tr(DcpOptions::kNxSettings[row.index].label);
+#endif
     case Kind::Cheat: return dcp::Tr(cheats.view(row.index).label);
     case Kind::Info: return Hotkeys()[row.index].label;
     case Kind::Online: return dcp::Tr(online_rows[row.index].label);
@@ -181,6 +251,14 @@ std::string Help(const RowRef& row, const CheatRows& cheats) {
                    ? std::string(dcp::Tr(setting.help)) + " " + dcp::Tr("Applies after a restart.")
                    : std::string(dcp::Tr(setting.help));
     }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    case Kind::NxSetting: {
+        const DcpOptions::NxSetting& setting = DcpOptions::kNxSettings[row.index];
+        return setting.apply == DcpOptions::Apply::Restart
+                   ? std::string(dcp::Tr(setting.help)) + " " + dcp::Tr("Applies after a restart.")
+                   : std::string(dcp::Tr(setting.help));
+    }
+#endif
     case Kind::Cheat: return cheats.view(row.index).help;
     case Kind::Info: return {};
     case Kind::Online: return TranslateOnlineHelp(online_rows[row.index].help);
@@ -225,6 +303,9 @@ void Change(const RowRef& row, int direction, const CheatRows& cheats) {
         }
         break;
     }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+    case Kind::NxSetting: ChangeNx(DcpOptions::kNxSettings[row.index], direction); break;
+#endif
     case Kind::Cheat: cheats.activate(row.index, direction); break;
     case Kind::Info: break;
     case Kind::Online:
@@ -347,10 +428,7 @@ void DrawRows(const std::vector<RowRef>& rows, int visible, const CheatRows& che
         case Kind::Setting: {
             const DcpOptions::Setting& setting = DcpOptions::kSettings[row.index];
             const std::string shown = Model().Shown(DcpOptions::Id(row.index));
-            const int index = DcpOptions::ChoiceIndex(setting, shown);
-            value = index >= 0 ? std::string(kArrowLeft) + "  " + std::string(dcp::Tr(std::string(setting.choices[size_t(index)].label))) +
-                                     "  " + kArrowRight
-                               : shown;
+            value = DcpOptions::ChoiceIndex(setting, shown) >= 0 ? FormatSettingValue(setting.choices, shown) : shown;
             steppable = true;
             if (setting.apply == DcpOptions::Apply::Restart) {
                 const float label_w = ImGui::CalcTextSize(label.c_str()).x;
@@ -358,6 +436,18 @@ void DrawRows(const std::vector<RowRef>& rows, int visible, const CheatRows& che
             }
             break;
         }
+#ifdef DCP_SWITCH_OPENGL_ONLY
+        case Kind::NxSetting: {
+            const DcpOptions::NxSetting& setting = DcpOptions::kNxSettings[row.index];
+            value = FormatSettingValue(setting.choices, NxShown(setting));
+            steppable = true;
+            if (setting.apply == DcpOptions::Apply::Restart) {
+                const float label_w = ImGui::CalcTextSize(label.c_str()).x;
+                draw->AddText(ImVec2(min.x + pad + label_w + em * 0.5f, y), ImGui::GetColorU32(kDim), dcp::Tr("(restart)"));
+            }
+            break;
+        }
+#endif
         case Kind::Cheat: {
             const CheatRowView view = cheats.view(row.index);
             value = view.state ? dcp::Tr(view.state) : "";
@@ -419,7 +509,7 @@ void DrawWrapped(const std::string& text, float capacity) {
 
 void DrawFooter(const ImVec4& accent, float line) {
     const float start_y = ImGui::GetCursorPosY();
-    if (Model().RestartPending()) {
+    if (Model().RestartPending() || nx_restart_pending) {
         ImGui::TextColored(accent, "%s", dcp::Tr(DcpOptions::kRestartNote));
     }
     if (!state.status.empty()) {

@@ -104,6 +104,16 @@ struct Timer {
 };
 /// Wall time the GPU command thread waited for guest submissions (ns).
 inline std::atomic<std::uint64_t> gpu_idle_ns{0};
+/// Wall time the GPU command thread slept on a VideoOut label (flip done, gated on the vblank tick) (ns).
+inline std::atomic<std::uint64_t> vo_wait_ns{0};
+/// Wall time guest threads waited in sceGnm* for the GPU to go idle (submission lock) (ns).
+inline std::atomic<std::uint64_t> guest_gpu_wait_ns{0};
+/// Wall time guest threads waited in sceVideoOutWaitVblank (ns).
+inline std::atomic<std::uint64_t> vblank_wait_ns{0};
+/// Submission locks the GPU left set while idle, dropped by WaitGpuIdle after its timeout.
+inline std::atomic<std::uint64_t> lock_heals{0};
+/// GpuIdle interrupts the GPU thread raised, locks they reset, locks sceGnmSubmitDone set.
+inline std::atomic<std::uint64_t> gpu_idle_signals{0}, lock_resets{0}, lock_sets{0};
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
 inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// Wall time spent blocked in the scheduler (ns): waiting for the recording thread to drain,

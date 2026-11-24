@@ -85,10 +85,16 @@ static void sysv_wrapper(x64emu_t *emu, uintptr_t fn) {
     uint64_t stack_count = SYSV_STACK_ARGS;
     /* Do not read past the top of a guest stack into an unmapped/guard page. */
     if ((sp & 0xFFF) > 0x1000 - SYSV_STACK_ARGS * 8) {
-        MemoryInfo mi = {0};
-        u32 pi = 0;
-        if (R_FAILED(svcQueryMemory(&mi, &pi, (sp + 0xFFF) & ~0xFFFULL)) || (mi.perm & Perm_R) == 0) {
-            stack_count = (0x1000 - (sp & 0xFFF)) / 8;
+        /* A hot call site at this depth would pay the syscall on every call: remember a readable page. */
+        static __thread uintptr_t readable_page;
+        const uintptr_t next = (sp + 0xFFF) & ~0xFFFULL;
+        if (next != readable_page) {
+            MemoryInfo mi = {0};
+            u32 pi = 0;
+            if (R_FAILED(svcQueryMemory(&mi, &pi, next)) || (mi.perm & Perm_R) == 0)
+                stack_count = (0x1000 - (sp & 0xFFF)) / 8;
+            else
+                readable_page = next;
         }
     }
     uint64_t rax = nx_sysv_call((void *)fn, gpr, xmm, (const uint64_t *)sp, stack_count, q0);
@@ -113,12 +119,17 @@ __thread int g_nx_guest_worker_id = 0;
  * a host thread dumps all slots every 5 s, so a hang shows who waits on what and for how long. */
 typedef struct {
     const char *thread, *hle, *last_hle;
+    volatile const char *sub; /* set inside an HLE call by nx_hle_subphase (gnm submit path) */
     uint64_t a0, a1, a2, ret_ip, t_enter, last_ret, calls, calls_seen;
     volatile int in_call, alive;
     x64emu_t *emu; /* registers are exact with DYNAREC=0; the dynarec only syncs them at block exits */
 } NxHleSlot;
 static NxHleSlot g_hle_slots[96];
 uint64_t nx_dyn_stat_block, nx_dyn_stat_interp; /* DynaRun: native blocks entered vs interpreter fallbacks */
+int nx_dyn_stats_on; /* STALL_DUMP only: the counters are contended atomics on every DynaRun pass */
+/* Set by the GPU command thread (liverpool.cpp): what it is doing since tick (CNTPCT), for STALL_DUMP. */
+volatile const char *nx_gpu_phase;
+volatile uint64_t nx_gpu_arg, nx_gpu_tick;
 uintptr_t nx_dyn_last_interp;
 static __thread NxHleSlot *t_hle_slot;
 static int g_stall_dump = -1;
@@ -139,6 +150,14 @@ static void *stall_dump_thread(void *unused) {
                           (unsigned long long)(ni - seen_interp),
                           (unsigned long long)((g_nx_image_base && li >= g_nx_image_base) ? li - g_nx_image_base : li));
         seen_block = nb; seen_interp = ni;
+        if (nx_gpu_phase) {
+            extern unsigned nx_gnm_state(void);
+            const unsigned gnm = nx_gnm_state();
+            nx_platform_trace("  GPU: %s arg=0x%llx for %llums; submission_lock=%u gpu_idle=%u\n",
+                              (const char *)nx_gpu_phase, (unsigned long long)nx_gpu_arg,
+                              (unsigned long long)(armTicksToNs(armGetSystemTick() - nx_gpu_tick) / 1000000ULL),
+                              gnm & 0xff, (gnm >> 8) & 1);
+        }
         for (int i = 0; i < (int)(sizeof g_hle_slots / sizeof *g_hle_slots); ++i) {
             NxHleSlot *s = &g_hle_slots[i];
             if (!s->alive) continue;
@@ -146,8 +165,9 @@ static void *stall_dump_thread(void *unused) {
             s->calls_seen = calls;
             uint64_t rel = (g_nx_image_base && s->ret_ip >= g_nx_image_base) ? s->ret_ip - g_nx_image_base : s->ret_ip;
             if (s->in_call)
-                nx_platform_trace("  [%d] %s: IN %s(0x%llx, 0x%llx, 0x%llx) for %llums @0x%llx, +%llu calls\n", i,
-                                  s->thread, s->hle, (unsigned long long)s->a0, (unsigned long long)s->a1,
+                nx_platform_trace("  [%d] %s: IN %s[%s](0x%llx, 0x%llx, 0x%llx) for %llums @0x%llx, +%llu calls\n", i,
+                                  s->thread, s->hle, s->sub ? (const char *)s->sub : "-",
+                                  (unsigned long long)s->a0, (unsigned long long)s->a1,
                                   (unsigned long long)s->a2, (unsigned long long)(now - s->t_enter),
                                   (unsigned long long)rel, (unsigned long long)delta);
             else
@@ -177,6 +197,7 @@ void nx_hle_thread_begin(const char *name) {
         const char *e = getenv("DCP_STALL_DUMP");
         g_stall_dump = (e && *e && strcmp(e, "0")) ? 1 : 0;
         if (g_stall_dump) {
+            nx_dyn_stats_on = 1;
             pthread_t th;
             pthread_create(&th, NULL, stall_dump_thread, NULL);
         }
@@ -192,6 +213,10 @@ void nx_hle_thread_begin(const char *name) {
         break;
     }
     mutexUnlock(&bridge_lock);
+}
+
+void nx_hle_subphase(const char *sub) {
+    if (t_hle_slot) t_hle_slot->sub = sub;
 }
 
 void nx_hle_thread_end(void) {
@@ -255,6 +280,7 @@ void EmuInt3(void *opaque, void *a) {
             slot->hle = nptr ? (const char *)nptr : "?";
             slot->a0 = arg0; slot->a1 = arg1; slot->a2 = arg2; slot->ret_ip = ret_ip;
             slot->t_enter = nx_now_ms();
+            slot->sub = NULL;
             slot->in_call = 1;
         }
         ((wrapper_t)w)(emu, fn);
@@ -264,7 +290,8 @@ void EmuInt3(void *opaque, void *a) {
             slot->last_ret = R_RAX;
             ++slot->calls;
         }
-        if (g_nx_guest_worker_id > 0 && nptr) {
+        static int w_count = 0; /* worker trace budget: past 150 lines, skip the strcmp chain */
+        if (g_nx_guest_worker_id > 0 && nptr && __atomic_load_n(&w_count, __ATOMIC_RELAXED) < 150) {
             const char *nm = (const char *)nptr;
             if (strcmp(nm, "memcpy") && strcmp(nm, "memset") && strcmp(nm, "memmove") &&
                 strcmp(nm, "memcmp") && strcmp(nm, "strlen") && strcmp(nm, "malloc") &&
@@ -272,7 +299,6 @@ void EmuInt3(void *opaque, void *a) {
                 strncmp(nm, "scePthreadMutex", 15) &&
                 strcmp(nm, "sceKernelGetProcessTimeCounter") && strcmp(nm, "sceKernelGetProcessTime") &&
                 strcmp(nm, "sceKernelReadTsc") && strcmp(nm, "sceKernelUsleep")) {
-                static int w_count = 0;
                 int c = __atomic_add_fetch(&w_count, 1, __ATOMIC_RELAXED);
                 if (c <= 150) {
                     extern void nx_platform_trace(const char *format, ...);
@@ -362,6 +388,8 @@ static void box64_process_init(void) {
     if (box64_ready) return;
     /* ARM64 hardware has weak memory ordering (unlike x86/Ryujinx TSO); default strongmem=1 unless overridden. */
     setenv("BOX64_DYNAREC_STRONGMEM", "1", 0);
+    /* No host DynaCache store on Switch: avoid cache file checks per block. */
+    setenv("BOX64_DYNACACHE", "0", 0);
     LoadEnvVariables();
     InitializeEnvFiles();
     InitializeSystemInfo();
@@ -383,6 +411,11 @@ static void box64_process_init(void) {
     box64_context.db_sizes = rbtree_init("db_sizes");
     InitX64Trace(&box64_context);
     exit_bridge = make_bridge(0, 0, "exit");
+    /* Without R+X in memprot the dynarec refuses every bridge block: each HLE call would leave the
+     * JIT, take the dynablock mutexes twice and run its INT3 + RET in the interpreter. */
+    const char *bridge_jit = getenv("DCP_NX_BRIDGE_JIT");
+    if (bridge_arena && !(bridge_jit && !strcmp(bridge_jit, "0")))
+        setProtection_elf((uintptr_t)bridge_arena, BRIDGE_ARENA, PROT_READ | PROT_EXEC);
     box64_ready = 1;
 }
 
@@ -434,6 +467,8 @@ NxX64Context *nx_x64_create(void *mem_base, size_t mem_size) {
  * Box64 cannot detect later writes to these pages: only code that is final at load time belongs here. */
 void nx_x64_mark_code(NxX64Context *ctx, void *addr, size_t size) {
     (void)ctx;
+    extern void nx_x64_register_code_range(uintptr_t start, size_t size);
+    nx_x64_register_code_range((uintptr_t)addr, size);
     setProtection_elf((uintptr_t)addr, size, PROT_READ | PROT_EXEC);
 }
 

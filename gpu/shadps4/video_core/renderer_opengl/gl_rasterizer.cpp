@@ -185,12 +185,25 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool* liverpool_, const Capabilities& capabi
       state{capabilities_.gles, capabilities_.depth_clamp},
       // Never freed: guest threads can fault on armed pages until the process ends.
       watch{new GuestWriteWatch(ProtectGuest)},
+#ifdef __SWITCH__
+      // Mesa's GLES has EXT_buffer_storage: real buffers, mapped once, instead of client arrays
+      // that Mesa re-uploads on every draw and a map/unmap of the shader ring per draw.
+      ring{state, capabilities_.buffer_storage ? RingStorage::Persistent
+                  : capabilities_.gles         ? RingStorage::ClientMemory
+                                               : RingStorage::Mapped},
+      gles_shader_ring{capabilities_.gles
+                           ? std::make_unique<StreamRing>(state, capabilities_.buffer_storage
+                                                                     ? RingStorage::Persistent
+                                                                     : RingStorage::Mapped)
+                           : nullptr},
+#else
       ring{state, capabilities_.gles                                       ? RingStorage::ClientMemory
                   : capabilities_.buffer_storage ? RingStorage::Persistent
                                                                : RingStorage::Mapped},
       gles_shader_ring{capabilities_.gles
                            ? std::make_unique<StreamRing>(state, RingStorage::ShaderTexture)
                            : nullptr},
+#endif
       shader_ring{gles_shader_ring ? *gles_shader_ring : ring},
       texture_cache{state, *watch, capabilities},
       shaders{state, max_viewport_width, max_viewport_height,
@@ -199,7 +212,13 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool* liverpool_, const Capabilities& capabi
       gds(GdsBytes) {
     fault_watch = watch;
     Core::Signals::Instance()->RegisterAccessViolationHandler(OnGuestFault, WatchFaultPriority);
-    std::printf("OpenGL: stream ring %s\n", gles            ? "client memory, shader data in a texture"
+#ifdef __SWITCH__
+    const char* GlesRing = ring.Persistent() ? "persistent, shader data in a persistent texture buffer"
+                                             : "client memory, shader data in a mapped texture buffer";
+#else
+    constexpr const char* GlesRing = "client memory, shader data in a texture";
+#endif
+    std::printf("OpenGL: stream ring %s\n", gles            ? GlesRing
                                             : ring.Persistent() ? "persistent"
                                                                 : "mapped per draw");
     if (anisotropy) {
@@ -217,6 +236,7 @@ Rasterizer::Rasterizer(AmdGpu::Liverpool* liverpool_, const Capabilities& capabi
     gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     texture_cache.SetDestroyCallback([this](GLuint texture) {
         state.ForgetFramebuffers();
+        has_last_framebuffer = false;
         std::erase_if(framebuffers, [&](const auto& entry) {
             const auto& cached = entry.second;
             if (std::ranges::find(cached.textures, texture) == cached.textures.end()) {
@@ -379,7 +399,13 @@ GLuint Rasterizer::FramebufferFor(const AttachedTargets& targets) {
     for (const Image* image : targets.color) {
         key = key * 0x100000001B3ull ^ (image ? image->handle : 0);
     }
+    if (has_last_framebuffer && last_framebuffer_key == key) {
+        return last_framebuffer;
+    }
     if (const auto it = framebuffers.find(key); it != framebuffers.end()) {
+        last_framebuffer_key = key;
+        last_framebuffer = it->second.handle;
+        has_last_framebuffer = true;
         return it->second.handle;
     }
     CachedFramebuffer cached{};
@@ -413,6 +439,9 @@ GLuint Rasterizer::FramebufferFor(const AttachedTargets& targets) {
         Report("a framebuffer combination is incomplete; its draws may be lost");
     }
     framebuffers.emplace(key, cached);
+    last_framebuffer_key = key;
+    last_framebuffer = framebuffer;
+    has_last_framebuffer = true;
     return framebuffer;
 }
 
@@ -511,7 +540,13 @@ GLuint Rasterizer::SamplerFor(AmdGpu::Sampler sharp, bool shadow, bool is_depth,
     }
     const SamplerKey key{sharp.raw0, sharp.raw1 ^ (force_aniso ? u64(forced) << 44 : 0), shadow,
                          nearest_only};
+    if (has_last_sampler && last_sampler_key == key) {
+        return last_sampler;
+    }
     if (const auto it = samplers.find(key); it != samplers.end()) {
+        last_sampler_key = key;
+        last_sampler = it->second;
+        has_last_sampler = true;
         return it->second;
     }
     GLuint sampler = 0;
@@ -564,6 +599,9 @@ GLuint Rasterizer::SamplerFor(AmdGpu::Sampler sharp, bool shadow, bool is_depth,
                                colors[sharp.border_color_ptr.Value()].data());
     }
     samplers.emplace(key, sampler);
+    last_sampler_key = key;
+    last_sampler = sampler;
+    has_last_sampler = true;
     return sampler;
 }
 
@@ -663,22 +701,34 @@ void Rasterizer::BindStage(const Shader::Info& info, StageLocations& locations,
                 break;
             }
             case Shader::BufferType::Flatbuf: {
+                // By content, like guest buffers: an unchanged copy keeps its offset, so the
+                // buffer table (a uniform upload per stage) does not change every draw.
                 const auto flat = info.FlatUserData();
                 size = u32(flat.size_bytes());
-                offset = shader_ring.Push(flat.data(), size, DwordAlignment);
+                offset = shader_ring.PushGuest(reinterpret_cast<VAddr>(flat.data()), size, DwordAlignment);
                 break;
             }
             case Shader::BufferType::ClipPlanes: {
-                std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                std::array<u32, AmdGpu::NUM_CLIP_PLANES * 4> raw_planes{};
                 for (u32 plane = 0; plane < AmdGpu::NUM_CLIP_PLANES; ++plane) {
                     const auto& data = regs.clip_user_data[plane];
-                    planes[plane * 4 + 0] = std::bit_cast<float>(data.data_x);
-                    planes[plane * 4 + 1] = std::bit_cast<float>(data.data_y);
-                    planes[plane * 4 + 2] = std::bit_cast<float>(data.data_z);
-                    planes[plane * 4 + 3] = std::bit_cast<float>(data.data_w);
+                    raw_planes[plane * 4 + 0] = data.data_x;
+                    raw_planes[plane * 4 + 1] = data.data_y;
+                    raw_planes[plane * 4 + 2] = data.data_z;
+                    raw_planes[plane * 4 + 3] = data.data_w;
                 }
-                size = u32(sizeof(planes));
-                offset = shader_ring.Push(planes.data(), size, DwordAlignment);
+                size = u32(sizeof(raw_planes));
+                const u32 ring_gen = shader_ring.CopyGeneration();
+                if (cached_clip_planes_offset != StreamRing::NoOffset &&
+                    cached_clip_planes_gen == ring_gen && cached_clip_planes == raw_planes) {
+                    offset = cached_clip_planes_offset;
+                } else {
+                    offset = shader_ring.PushGuest(reinterpret_cast<VAddr>(raw_planes.data()), size,
+                                                   DwordAlignment);
+                    cached_clip_planes = raw_planes;
+                    cached_clip_planes_gen = ring_gen;
+                    cached_clip_planes_offset = offset;
+                }
                 break;
             }
             default:
@@ -745,6 +795,15 @@ bool Rasterizer::BindVertexInputs(const GraphicsProgram& program, u32 first_inst
     vertex_reach = std::numeric_limits<u64>::max();
     if (fetch) {
         using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+        // Interleaved attributes often name staggered bases into the same guest VBO; reuse the
+        // first pushed slice within this draw instead of re-hashing the remaining tail per attribute.
+        struct PushedSlice {
+            VAddr base;
+            u32 size;
+            u32 offset;
+        };
+        std::array<PushedSlice, MaxVertexAttributes> pushed_slices{};
+        u32 num_pushed_slices = 0;
         for (const auto& attrib : fetch->attributes) {
             if (attrib.semantic >= MaxVertexAttributes) {
                 Report("a vertex attribute beyond the sixteen OpenGL guarantees was dropped");
@@ -762,10 +821,26 @@ bool Rasterizer::BindVertexInputs(const GraphicsProgram& program, u32 first_inst
                 continue;
             }
             const u32 size = u32(memory->ClampRangeSize(buffer.base_address, buffer.GetSize()));
-            const u32 pushed = ring.PushGuest(buffer.base_address, size, VertexAlignment);
+            u32 pushed = StreamRing::NoOffset;
+            for (u32 s = 0; s < num_pushed_slices; ++s) {
+                const auto& prev = pushed_slices[s];
+                if (buffer.base_address >= prev.base) {
+                    const u64 delta = buffer.base_address - prev.base;
+                    if (delta + size <= prev.size) {
+                        pushed = prev.offset + u32(delta);
+                        break;
+                    }
+                }
+            }
             if (pushed == StreamRing::NoOffset) {
-                Report("vertex data larger than the stream ring was dropped");
-                return false;
+                pushed = ring.PushGuest(buffer.base_address, size, VertexAlignment);
+                if (pushed == StreamRing::NoOffset) {
+                    Report("vertex data larger than the stream ring was dropped");
+                    return false;
+                }
+                if (num_pushed_slices < pushed_slices.size()) {
+                    pushed_slices[num_pushed_slices++] = {buffer.base_address, size, pushed};
+                }
             }
             const u64 offset = ring.PointerBase() + pushed;
             const u32 stride = buffer.GetStride();
@@ -801,7 +876,7 @@ bool Rasterizer::BindVertexInputs(const GraphicsProgram& program, u32 first_inst
             }
             const u64 start = per_vertex ? u64(first_vertex) * stride : first;
             // ANGLE copies client memory by what the draw names, so nothing may name past the ring.
-            if (gles) {
+            if (gles && !ring.Persistent()) {
                 const u32 instances = regs.num_instances.NumInstances();
                 const u64 instance_step = u64(stride) * ((instances - 1) / std::max(divisor, 1u));
                 const auto reach = HighestElementInside(u64(pushed) + start + (divisor ? instance_step : 0),
@@ -1210,6 +1285,12 @@ void Rasterizer::ApplyBlend(const GraphicsProgram& program, const AttachedTarget
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedDraw*) {
+#ifdef __SWITCH__
+    struct DrawScope {
+        u64 t0 = NxTick();
+        ~DrawScope() { g_nx_prof.draw.fetch_add(NxTick() - t0, std::memory_order_relaxed); }
+    } draw_scope;
+#endif
     ++draws;
     if (!FilterDraw()) {
         return;
@@ -1217,7 +1298,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
     const auto& regs = liverpool->regs;
     const bool rect_list = gles && regs.primitive_type == AmdGpu::PrimitiveType::RectList;
     const bool rect_tables = RectListUsesTables(rect_list, is_indexed, indexed_rect_tables);
+#ifdef __SWITCH__
+    const u64 t_shd = NxTick();
+#endif
     GraphicsProgram* program = shaders.GetGraphics(regs, rect_tables);
+#ifdef __SWITCH__
+    g_nx_prof.shd.fetch_add(NxTick() - t_shd, std::memory_order_relaxed);
+#endif
     if (!program) {
         return;
     }
@@ -1232,9 +1319,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
         return;
     }
     AttachedTargets targets{};
+#ifdef __SWITCH__
+    const u64 t_tgt = NxTick();
+#endif
     if (!BindTargets(*program, targets)) {
+#ifdef __SWITCH__
+        g_nx_prof.tgt.fetch_add(NxTick() - t_tgt, std::memory_order_relaxed);
+#endif
         return;
     }
+#ifdef __SWITCH__
+    g_nx_prof.tgt.fetch_add(NxTick() - t_tgt, std::memory_order_relaxed);
+#endif
     state.BindVertexArray(vertex_array);
     state.UseProgram(program->handle);
     BeginStreams();
@@ -1249,6 +1345,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
         trace_textures.clear();
         trace_bind_stage = 'V';
     }
+#ifdef __SWITCH__
+    const u64 t_stg = NxTick();
+#endif
     BindStage(vs_info, program->vs, program->vertex->glsl);
     if (program->fragment) {
         if (trace_file) {
@@ -1256,12 +1355,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
         }
         BindStage(*program->fragment->info, program->fs, program->fragment->glsl);
     }
+#ifdef __SWITCH__
+    g_nx_prof.stg.fetch_add(NxTick() - t_stg, std::memory_order_relaxed);
+#endif
     // Elements on OpenGL ES have no base vertex here, and gl_VertexID would not include it anyway.
     const u32 moved_vertices = gles && (is_indexed || quad_list || rect_list) ? vertex_offset : 0;
     GLsizei rect_strips = 0;
+#ifdef __SWITCH__
+    const u64 t_vtx = NxTick();
+#endif
     const bool prepared =
         rect_tables ? PrepareIndexedRectangles(*program, index_offset, vertex_offset, instance_offset, rect_strips)
                     : BindVertexInputs(*program, instance_offset, moved_vertices, rect_list);
+#ifdef __SWITCH__
+    g_nx_prof.vtx.fetch_add(NxTick() - t_vtx, std::memory_order_relaxed);
+#endif
     if (!prepared) {
         static bool logged_drop = false;
         if (!logged_drop) {
@@ -1310,20 +1418,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
             Report("index data larger than the stream ring was dropped");
             return;
         }
-        // The ring's copy, not guest memory: it is what the driver will read.
-        if (gles) {
+        // The ring's copy, not guest memory: it is what the driver will read. A buffer-backed
+        // ring has no CPU copy to read (and reading a mapped GPU buffer back is slow): the source.
+        if (gles && !ring.Persistent()) {
             std::optional<u32> highest;
             const bool restart = (regs.enable_primitive_restart & 1) != 0;
-            VisitGuestIndices(ring.PointerBase() + index_ring_offset, index_count, index_size,
+            const VAddr indices = ring.PointerBase() ? ring.PointerBase() + index_ring_offset : address;
+            VisitGuestIndices(indices, index_count, index_size,
                               [&](auto span) { highest = HighestIndex(span, restart); });
             if (!highest || !VerticesReachable(*highest)) {
                 return;
             }
         }
-    } else if (gles && !rect_list && !VerticesReachable(u64(vertex_offset) + regs.num_indices)) {
+    } else if (gles && !ring.Persistent() && !rect_list &&
+               !VerticesReachable(u64(vertex_offset) + regs.num_indices)) {
         return;
     }
+#ifdef __SWITCH__
+    const u64 t_cmt = NxTick();
+#endif
     CommitStreams();
+#ifdef __SWITCH__
+    g_nx_prof.cmt.fetch_add(NxTick() - t_cmt, std::memory_order_relaxed);
+    const u64 t_st = NxTick();
+#endif
 
     if (program->vertex_id_base >= 0 &&
         UniformChanged(program->sent_vertex_id_base, moved_vertices)) {
@@ -1347,8 +1465,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
     if (restart) {
         state.PrimitiveRestartIndex(index16 ? 0xFFFFu : 0xFFFFFFFFu);
     }
+#ifdef __SWITCH__
+    g_nx_prof.st.fetch_add(NxTick() - t_st, std::memory_order_relaxed);
+#endif
 
     const GLsizei instances = GLsizei(regs.num_instances.NumInstances());
+#ifdef __SWITCH__
+    const u64 gl_t0 = NxTick();
+#endif
     if (rect_tables) {
         gl::DrawArraysInstanced(mode, 0, RectStripVertices, rect_strips);
     } else if (rect_list) {
@@ -1370,6 +1494,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Vulkan::PreparedD
     } else {
         gl::DrawArraysInstanced(mode, GLint(vertex_offset), count, instances);
     }
+#ifdef __SWITCH__
+    g_nx_prof.gl_draw.fetch_add(NxTick() - gl_t0, std::memory_order_relaxed);
+#endif
     if (++draws_reaching_gl == 1) {
 #ifdef __SWITCH__
         nx_platform_trace("OpenGL: first guest draw submitted (vs %#llx, ps %#llx, %d indices)\n",
@@ -1494,15 +1621,76 @@ bool Rasterizer::TryKnownCompute(const Shader::Info& info) {
         const u64 threads = u64(cs.dim_x) * cs.num_thread_x.full;
         const u64 count = std::min<u64>(threads, written.GetSize() / 4);
         auto* out = reinterpret_cast<u32*>(written.base_address);
-        watch->BeforeHostWrite(written.base_address, count * sizeof(u32));
-        std::fill(out, out + count, *reinterpret_cast<const u32*>(read.base_address));
-        texture_cache.NoteGpuWrite(written.base_address, count * sizeof(u32));
+        const u32 value = *reinterpret_cast<const u32*>(read.base_address);
+        const u64 bytes = count * sizeof(u32);
+        // GPU draws never write back to guest memory here, so after the first fill of a display
+        // buffer the memory already holds the value: fill again only if its sampled hash moved.
+        auto& last = last_fills[written.base_address];
+        if (last.bytes != bytes || last.value != value ||
+            last.hash != HashGuestRange(reinterpret_cast<const u8*>(out), bytes)) {
+            watch->BeforeHostWrite(written.base_address, bytes);
+            std::fill(out, out + count, value);
+            last = {bytes, value, HashGuestRange(reinterpret_cast<const u8*>(out), bytes)};
+        }
+        // The game clears its display buffers this way every frame: a GL clear instead of
+        // re-uploading the whole render target from guest memory.
+        const Image* cleared = ClearFilledImage(written.base_address, count * sizeof(u32), value);
+        texture_cache.NoteGpuWrite(written.base_address, count * sizeof(u32), cleared);
         return true;
     }
     return false;
 }
 
+Image* Rasterizer::ClearFilledImage(VAddr address, u64 size, u32 value) {
+    Image* image = texture_cache.FindAt(address, size);
+    if (!image || image->target != GL_TEXTURE_2D || image->info.props.is_depth ||
+        image->info.resources.levels != 1 || image->info.resources.layers != 1 ||
+        image->info.num_bits != 32 || !image->format || image->format->type != GL_UNSIGNED_BYTE) {
+        return nullptr;
+    }
+    // Memory order of the four bytes, as Upload would store them.
+    const auto& fmt = *image->format;
+    bool bgra;
+    if (fmt.conversion == TexelConversion::None && fmt.format == GL_RGBA) {
+        bgra = false;
+    } else if ((fmt.conversion == TexelConversion::None && fmt.format == GL_BGRA) ||
+               (fmt.conversion == TexelConversion::SwapRedBlue8888 && fmt.format == GL_RGBA)) {
+        bgra = true;
+    } else {
+        return nullptr;
+    }
+    // Only 0 and 1 per channel: the same in UNORM and sRGB, so no encoding question.
+    std::array<float, 4> bytes{};
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 b = (value >> (8 * i)) & 0xffu;
+        if (b != 0 && b != 0xffu) {
+            return nullptr;
+        }
+        bytes[i] = b ? 1.0f : 0.0f;
+    }
+    const std::array<float, 4> color{bgra ? bytes[2] : bytes[0], bytes[1], bgra ? bytes[0] : bytes[2],
+                                     bytes[3]};
+    AttachedTargets targets{};
+    targets.color[0] = image;
+    state.BindFramebuffer(FramebufferFor(targets));
+    state.Enable(GlState::Cap::ScissorTest, false);
+    state.Enable(GlState::Cap::RasterizerDiscard, false);
+    state.ColorMask(0, 0xF);
+    gl::ClearBufferfv(GL_COLOR, 0, color.data());
+    return image;
+}
+
 void Rasterizer::DispatchDirect() {
+#ifdef __SWITCH__
+    const u64 cs_t0 = NxTick();
+    struct CsScope {
+        u64 t0;
+        ~CsScope() {
+            g_nx_prof.cs.fetch_add(NxTick() - t0, std::memory_order_relaxed);
+            g_nx_prof.cs_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    } cs_scope{cs_t0};
+#endif
     const auto& cs = liverpool->GetCsRegs();
     const Shader::Info* info = shaders.GetCompute(cs);
     const bool known = TryKnownCompute(*info);

@@ -202,16 +202,18 @@ static const struct { const char *name; uint32_t ps; } ps_names[]={
 };
 typedef struct { int source; uint32_t ps; } ButtonSource;
 typedef struct { ButtonSource entries[48]; size_t count; } ButtonMap;
-static ButtonMap pad_map={{
-    {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE},
-    {SDL_GAMEPAD_BUTTON_WEST,BTN_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH,BTN_TRIANGLE},
-    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,BTN_L1}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,BTN_R1},
-    {SDL_GAMEPAD_BUTTON_LEFT_STICK,BTN_L3}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK,BTN_R3},
-    {SDL_GAMEPAD_BUTTON_START,BTN_OPTIONS}, {SDL_GAMEPAD_BUTTON_BACK,BTN_TOUCHPAD},
-    {SDL_GAMEPAD_BUTTON_TOUCHPAD,BTN_TOUCHPAD},
-    {SDL_GAMEPAD_BUTTON_DPAD_UP,BTN_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN,BTN_DOWN},
-    {SDL_GAMEPAD_BUTTON_DPAD_LEFT,BTN_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,BTN_RIGHT},
-},15};
+#define DCP_DEFAULT_PAD_MAP {{ \
+    {SDL_GAMEPAD_BUTTON_SOUTH,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_EAST,BTN_CIRCLE}, \
+    {SDL_GAMEPAD_BUTTON_WEST,BTN_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH,BTN_TRIANGLE}, \
+    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,BTN_L1}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,BTN_R1}, \
+    {SDL_GAMEPAD_BUTTON_LEFT_STICK,BTN_L3}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK,BTN_R3}, \
+    {SDL_GAMEPAD_BUTTON_START,BTN_OPTIONS}, {SDL_GAMEPAD_BUTTON_BACK,BTN_TOUCHPAD}, \
+    {SDL_GAMEPAD_BUTTON_TOUCHPAD,BTN_TOUCHPAD}, \
+    {SDL_GAMEPAD_BUTTON_DPAD_UP,BTN_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN,BTN_DOWN}, \
+    {SDL_GAMEPAD_BUTTON_DPAD_LEFT,BTN_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,BTN_RIGHT}, \
+},15}
+static const ButtonMap default_pad_map=DCP_DEFAULT_PAD_MAP;
+static ButtonMap pad_map=DCP_DEFAULT_PAD_MAP;
 static ButtonMap key_map;
 static DcpKeyMap keys;
 static void log_rumble(const char *source) {
@@ -402,10 +404,44 @@ static void sample_host(int slot, PadData *d) {
 static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-1,-1,-1,-1},-1};
 static int replay_armed;      /* 1 while a DCP_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
-static void read_inject(void) {
-    static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
+static void push_inject_events(uint32_t prev, uint32_t next) {
+    if (prev == next || !SDL_WasInit(SDL_INIT_GAMEPAD)) return;
+    static const struct { uint32_t ps; SDL_GamepadButton btn; } btns[] = {
+        {BTN_L3, SDL_GAMEPAD_BUTTON_LEFT_STICK}, {BTN_R3, SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+        {BTN_UP, SDL_GAMEPAD_BUTTON_DPAD_UP}, {BTN_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {BTN_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {BTN_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {BTN_L1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER}, {BTN_R1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+        {BTN_CROSS, SDL_GAMEPAD_BUTTON_SOUTH}, {BTN_CIRCLE, SDL_GAMEPAD_BUTTON_EAST},
+        {BTN_SQUARE, SDL_GAMEPAD_BUTTON_WEST}, {BTN_TRIANGLE, SDL_GAMEPAD_BUTTON_NORTH},
+        {BTN_OPTIONS, SDL_GAMEPAD_BUTTON_START},
+    };
+    for (size_t i = 0; i < sizeof(btns) / sizeof(*btns); ++i) {
+        const uint32_t was = prev & btns[i].ps, now = next & btns[i].ps;
+        if (was == now) continue;
+        SDL_Event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = now ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
+#ifdef __SWITCH__
+        ev.cbutton.which = 0;
+        ev.cbutton.button = (Uint8)btns[i].btn;
+        ev.cbutton.state = now ? SDL_PRESSED : SDL_RELEASED;
+#else
+        ev.gbutton.which = 1;
+        ev.gbutton.button = (Uint8)btns[i].btn;
+        ev.gbutton.down = now != 0;
+#endif
+        SDL_PushEvent(&ev);
+    }
+}
+static const char *inject_pad_path(void) {
+    static const char *path; static int checked;
     if (!checked) { path=getenv("DCP_PAD_FILE"); checked=1; }
-    if (!path || !*path) return;
+    return (path && *path) ? path : NULL;
+}
+static void read_inject(void) {
+    static uint64_t last_check; static struct timespec mtime; static uint32_t pushed_buttons;
+    const char *path=inject_pad_path();
+    if (!path) return;
     uint64_t now=now_us();
     if (now-last_check<20000) return;
     last_check=now;
@@ -438,6 +474,8 @@ static void read_inject(void) {
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
     }
     fclose(f);
+    push_inject_events(pushed_buttons, injected.buttons);
+    pushed_buttons=injected.buttons;
     printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
            injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
 }
@@ -706,6 +744,19 @@ void runtime_pad_rumble_changed(void) {
     if (dcpgpu_controller_rumble()) return;
     pthread_mutex_lock(&lock);
     for (int i=0;i<MAX_PADS;++i) if (slots[i].gamepad) SDL_RumbleGamepad(slots[i].gamepad,0,0,0);
+    pthread_mutex_unlock(&lock);
+}
+void runtime_pad_set_map(const char *spec) {
+    pthread_mutex_lock(&lock);
+    pad_map=default_pad_map;
+    const int n=apply_button_map(&pad_map,spec,false);
+    printf("Runtime: pad map updated (%d entries)\n",n);
+    pthread_mutex_unlock(&lock);
+}
+void runtime_pad_pump_inject(void) {
+    if (!inject_pad_path()) return;
+    pthread_mutex_lock(&lock);
+    read_inject();
     pthread_mutex_unlock(&lock);
 }
 static ABI int32_t pad_ok_handle(int32_t handle) { return open_slot(handle)>=0 ? 0 : ERR_INVALID_HANDLE; }

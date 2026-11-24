@@ -856,6 +856,12 @@ int main(int argc, char **argv) {
     const int discord_presence=!check_imports && !cpu_only && discord_presence_start(settings_file,app0);
 #endif
     render_resolution=&dcp_resolutions[dcp_render_resolution(settings_file,paths.image_dir)];
+#ifdef __SWITCH__
+    const int nx_handheld = nx_platform_handheld();
+    if (nx_handheld && render_resolution == &dcp_resolutions[0]) {
+        render_resolution = &dcp_resolutions[2]; /* 720p in undocked handheld mode */
+    }
+#endif
     aspect_ratio=&dcp_aspect_ratios[dcp_aspect_ratio(settings_file,paths.image_dir)];
     render_target=dcp_render_target(render_resolution,aspect_ratio);
     const int true_ultrawide_requested=dcp_true_ultrawide(settings_file);
