@@ -38,13 +38,31 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def find_build_packages(game_root, title, version):
+def iter_pkg_paths(game_root, pkg_args):
+    if not pkg_args:
+        return sorted(game_root.glob('*.pkg'))
+    found, seen = [], set()
+    for raw in pkg_args:
+        p = Path(raw).expanduser().resolve()
+        items = sorted(p.glob('*.pkg')) if p.is_dir() else [p]
+        if not items:
+            fail(f'no .pkg files found in {p}')
+        for item in items:
+            if not item.is_file():
+                fail(f'package file not found: {item}')
+            if item not in seen:
+                seen.add(item)
+                found.append(item)
+    return found
+
+
+def find_build_packages(game_root, title, version, pkg_args=None):
     """The build to prepare and its packages, one per layer: (title, version, profile, [(path, info), ...]).
 
     Packages are classified by their metadata, not by name. A build is complete when each of its layers has one package.
     """
     by_identity = {}
-    for path in sorted(game_root.glob('*.pkg')):
+    for path in iter_pkg_paths(game_root, pkg_args):
         try:
             info = pkg_info.inspect(str(path))
         except (OSError, ValueError) as error:
@@ -68,7 +86,8 @@ def find_build_packages(game_root, title, version):
                 builds.append((found_title, found_version, profile, [candidates[0] for candidates in found]))
     if not builds:
         wanted = ' '.join(x for x in (title, version) if x)
-        fail(f'no complete supported build{" for " + wanted if wanted else ""} in {game_root}')
+        where = ', '.join(str(x) for x in pkg_args) if pkg_args else str(game_root)
+        fail(f'no complete supported build{" for " + wanted if wanted else ""} in {where}')
     if len(builds) > 1:
         names = ', '.join(f'{t} {v}' for t, v, _, _ in builds)
         fail(f'the packages complete several builds ({names}); pass --version to choose one')
@@ -104,6 +123,7 @@ def extract(pkg_path, target, only, label):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--game-root', type=Path, default=ROOT / 'game')
+    parser.add_argument('--pkg', nargs='+', help='one or more PS4 .pkg files (or a folder containing them)')
     parser.add_argument('--title', help='title to prepare: CUSA10454, CUSA07001, CUSA10209 or CUSA10487')
     parser.add_argument('--version', help='profile version to prepare (CUSA10454: 1.00 or 1.01; CUSA07001: 1.00, 1.02 or 1.03; CUSA10209: 1.00 or 1.02; CUSA10487: 1.03)')
     parser.add_argument('--scope', choices=('core', 'full'), default='core',
@@ -117,7 +137,7 @@ def main():
     if args.version and args.version not in versions:
         fail(f'unsupported version {args.version}; supported: {", ".join(sorted(versions))}')
     root = args.game_root.resolve()
-    title, version, profile, packages = find_build_packages(root, args.title, args.version)
+    title, version, profile, packages = find_build_packages(root, args.title, args.version, args.pkg)
     build = profile['versions'][version]
     full = args.scope == 'full'
     only = None if full else list(profile['core_patterns'])
